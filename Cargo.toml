@@ -1,0 +1,22 @@
+[workspace]
+members = ["apps/server", "crates/protocol", "crates/runtime"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97.1"
+version = "0.1.0"
+
+[workspace.dependencies]
+axum = { version = "=0.8.9", features = ["json"] }
+nexa-protocol = { path = "crates/protocol" }
+nexa-runtime = { path = "crates/runtime" }
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "stream"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
+tokio-stream = "=0.1.19"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
