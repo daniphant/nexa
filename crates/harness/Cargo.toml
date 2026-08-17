@@ -1,0 +1,24 @@
+[package]
+name = "nexa-harness"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+nexa-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

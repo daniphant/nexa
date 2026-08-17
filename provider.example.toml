@@ -1,0 +1,16 @@
+# provider.toml is a model registry. Credentials stay outside this file.
+
+[providers.xai]
+name = "xAI"
+base_url = "https://api.x.ai/v1"
+api_format = "chat_completions"
+models = ["grok-code-fast-1"]
+api_key_env = "XAI_API_KEY"
+
+# Providers may expose the same model ID. Clients select both the provider and
+# model, so the pair remains unambiguous.
+[providers.local]
+name = "Local"
+base_url = "http://127.0.0.1:8080/v1"
+api_format = "chat_completions"
+models = ["grok-code-fast-1", "local-coder"]

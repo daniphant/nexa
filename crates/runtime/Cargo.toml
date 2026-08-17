@@ -1,0 +1,14 @@
+[package]
+name = "nexa-runtime"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+nexa-harness.workspace = true
+nexa-protocol.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
