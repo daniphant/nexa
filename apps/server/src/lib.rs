@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use nexa_protocol::Command;
-use nexa_runtime::LocalSession;
+use nexa_runtime::{LocalSession, SessionError};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
@@ -31,17 +31,29 @@ async fn accept_command(State(session): State<LocalSession>, request: Request) -
     };
 
     match command {
-        Command::SendMessage { client_id, text } => {
+        Command::SendMessage {
+            client_id,
+            model,
+            text,
+        } => {
             let client_id = client_id.trim();
+            let model = nexa_protocol::ModelRef {
+                provider: model.provider.trim().to_owned(),
+                id: model.id.trim().to_owned(),
+            };
             let text = text.trim();
-            if client_id.is_empty() || text.is_empty() {
+            if client_id.is_empty()
+                || model.provider.is_empty()
+                || model.id.is_empty()
+                || text.is_empty()
+            {
                 return error_response(
                     StatusCode::BAD_REQUEST,
-                    "clientId and text must not be empty",
+                    "clientId, model, and text must not be empty",
                 );
             }
 
-            match session.append_message(client_id, text).await {
+            match session.append_message(client_id, &model, text).await {
                 Ok(event) => (
                     StatusCode::CREATED,
                     Json(AcceptedCommand {
@@ -50,6 +62,12 @@ async fn accept_command(State(session): State<LocalSession>, request: Request) -
                     }),
                 )
                     .into_response(),
+                Err(SessionError::Busy) => {
+                    error_response(StatusCode::CONFLICT, "the local agent is already running")
+                }
+                Err(SessionError::InvalidModel(error)) => {
+                    error_response(StatusCode::BAD_REQUEST, &error)
+                }
                 Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
             }
         }

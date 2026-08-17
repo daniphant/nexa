@@ -1,6 +1,7 @@
-use std::{error::Error, time::Duration};
+use std::{error::Error, sync::Arc, time::Duration};
 
-use nexa_protocol::{Command, Event};
+use nexa_harness::{Agent, AgentEvent, AgentRequest};
+use nexa_protocol::{Command, Event, ModelRef};
 use nexa_runtime::LocalSession;
 use reqwest::{Client, Response, StatusCode};
 use tempfile::tempdir;
@@ -38,7 +39,8 @@ async fn two_clients_share_one_ordered_replayable_session() -> TestResult {
 
     let mut client_ids = events_for_a
         .iter()
-        .map(|event| event.client_id().to_owned())
+        .filter_map(Event::client_id)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     client_ids.sort();
     assert_eq!(client_ids, ["alice", "bob"]);
@@ -53,6 +55,104 @@ async fn two_clients_share_one_ordered_replayable_session() -> TestResult {
 
     server.abort();
     Ok(())
+}
+
+#[tokio::test]
+async fn an_agent_response_uses_the_same_durable_stream() -> TestResult {
+    let directory = tempdir()?;
+    let event_log_path = directory.path().join("local.ndjson");
+    let session = LocalSession::open_with_agent(&event_log_path, Arc::new(ReplyingAgent)).await?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let server = spawn_server(listener, session);
+
+    let http = Client::new();
+    let mut client_a = EventClient::connect(&http, &base_url).await?;
+    let mut client_b = EventClient::connect(&http, &base_url).await?;
+    assert_eq!(
+        send_message(&http, &base_url, "alice", "hello agent").await?,
+        StatusCode::CREATED
+    );
+
+    let mut events_for_a = Vec::new();
+    let mut events_for_b = Vec::new();
+    loop {
+        let event_a = client_a.next().await?;
+        let event_b = client_b.next().await?;
+        let completed = matches!(event_a, Event::RunCompleted { .. });
+        events_for_a.push(event_a);
+        events_for_b.push(event_b);
+        if completed {
+            break;
+        }
+    }
+
+    assert_eq!(events_for_a, events_for_b);
+    assert!(matches!(events_for_a[0], Event::Message { .. }));
+    assert!(matches!(events_for_a[1], Event::RunStarted { .. }));
+    assert!(events_for_a.iter().any(|event| matches!(
+        event,
+        Event::AssistantMessage { text, .. } if text == "hello human"
+    )));
+    assert_eq!(
+        events_for_a.iter().map(Event::sequence).collect::<Vec<_>>(),
+        (1..=u64::try_from(events_for_a.len())?).collect::<Vec<_>>()
+    );
+    let persisted = tokio::fs::read_to_string(event_log_path).await?;
+    assert_eq!(persisted.lines().count(), events_for_a.len());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_an_unknown_provider_model_pair_before_recording_it() -> TestResult {
+    let directory = tempdir()?;
+    let event_log_path = directory.path().join("local.ndjson");
+    let session = LocalSession::open_with_agent(&event_log_path, Arc::new(RejectingAgent)).await?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let server = spawn_server(listener, session);
+
+    let status = send_message(&Client::new(), &base_url, "alice", "hello agent").await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(tokio::fs::read_to_string(event_log_path).await?.is_empty());
+
+    server.abort();
+    Ok(())
+}
+
+struct ReplyingAgent;
+
+impl Agent for ReplyingAgent {
+    fn start(&self, _request: AgentRequest) -> tokio::sync::mpsc::UnboundedReceiver<AgentEvent> {
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        events
+            .send(AgentEvent::AssistantTextDelta("hello human".to_owned()))
+            .expect("test receiver should remain open");
+        events
+            .send(AgentEvent::AssistantMessage {
+                text: "hello human".to_owned(),
+                tool_calls: Vec::new(),
+            })
+            .expect("test receiver should remain open");
+        events
+            .send(AgentEvent::Completed)
+            .expect("test receiver should remain open");
+        receiver
+    }
+}
+
+struct RejectingAgent;
+
+impl Agent for RejectingAgent {
+    fn validate_model(&self, _model: &ModelRef) -> Result<(), String> {
+        Err("unknown provider/model pair".to_owned())
+    }
+
+    fn start(&self, _request: AgentRequest) -> tokio::sync::mpsc::UnboundedReceiver<AgentEvent> {
+        panic!("an invalid model must not start the agent")
+    }
 }
 
 fn spawn_server(listener: TcpListener, session: LocalSession) -> JoinHandle<()> {
@@ -73,6 +173,10 @@ async fn send_message(
         .post(format!("{base_url}/commands"))
         .json(&Command::SendMessage {
             client_id: client_id.to_owned(),
+            model: ModelRef {
+                provider: "test-provider".to_owned(),
+                id: "test-model".to_owned(),
+            },
             text: text.to_owned(),
         })
         .send()

@@ -1,21 +1,23 @@
 [package]
-name = "nexa-server"
+name = "nexa-harness"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-axum.workspace = true
-nexa-harness.workspace = true
+futures-util.workspace = true
 nexa-protocol.workspace = true
-nexa-runtime.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true
+axum.workspace = true
 tempfile.workspace = true
 
 [lints]
