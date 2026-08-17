@@ -105,10 +105,11 @@ curl -N http://127.0.0.1:4123/events
 The harness currently exposes exactly two workspace-scoped tools:
 
 - `read_file` reads a bounded UTF-8 text file.
-- `edit_file` replaces one exact, unique text fragment and reports before/after hashes.
+- `edit_file` creates a missing file when `old_text` is empty, or replaces one
+  exact, unique text fragment and reports before/after hashes.
 
 Absolute paths, parent traversal, symlink escapes, binary reads, oversized reads,
-zero-match edits, and ambiguous edits are rejected.
+implicit overwrites, zero-match edits, and ambiguous edits are rejected.
 
 ## Verification
 

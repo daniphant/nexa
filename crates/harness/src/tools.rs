@@ -80,7 +80,7 @@ impl WorkspaceTools {
     async fn edit_file(&self, arguments: &str) -> Result<String, String> {
         let arguments: EditFileArguments = parse_arguments(arguments, "edit_file")?;
         if arguments.old_text.is_empty() {
-            return Err("edit_file old_text must not be empty".to_owned());
+            return self.create_file(arguments).await;
         }
         let path = self.resolve_existing_file(&arguments.path).await?;
         let content = fs::read_to_string(&path).await.map_err(|error| {
@@ -114,18 +114,60 @@ impl WorkspaceTools {
         .to_string())
     }
 
-    async fn resolve_existing_file(&self, requested: &str) -> Result<PathBuf, String> {
-        let requested_path = Path::new(requested);
-        if requested_path.as_os_str().is_empty()
-            || requested_path.is_absolute()
-            || requested_path
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-        {
-            return Err(
-                "tool paths must be relative to the workspace and may not contain ..".to_owned(),
-            );
+    async fn create_file(&self, arguments: EditFileArguments) -> Result<String, String> {
+        let requested_path = validate_relative_path(&arguments.path)?;
+        let path = self.root.join(requested_path);
+        match fs::symlink_metadata(&path).await {
+            Ok(_) => {
+                return Err(
+                    "edit_file old_text may only be empty when creating a missing file".to_owned(),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect {:?} before creating it: {error}",
+                    arguments.path
+                ));
+            }
         }
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| "new file has no parent directory".to_owned())?;
+        let canonical_parent = fs::canonicalize(parent).await.map_err(|error| {
+            format!(
+                "could not resolve the parent directory for {:?}: {error}",
+                arguments.path
+            )
+        })?;
+        if !canonical_parent.starts_with(&self.root) {
+            return Err(format!(
+                "path {:?} resolves outside the workspace",
+                arguments.path
+            ));
+        }
+
+        let after_sha256 = sha256(&arguments.new_text);
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| "new file has no file name".to_owned())?;
+        let write_path = canonical_parent.join(file_name);
+        tokio::task::spawn_blocking(move || atomic_create(&write_path, arguments.new_text))
+            .await
+            .map_err(|error| format!("edit_file write task failed: {error}"))?
+            .map_err(|error| format!("could not create {:?}: {error}", arguments.path))?;
+
+        Ok(json!({
+            "path": arguments.path,
+            "created": true,
+            "afterSha256": after_sha256,
+        })
+        .to_string())
+    }
+
+    async fn resolve_existing_file(&self, requested: &str) -> Result<PathBuf, String> {
+        let requested_path = validate_relative_path(requested)?;
 
         let canonical = fs::canonicalize(self.root.join(requested_path))
             .await
@@ -163,7 +205,7 @@ impl ToolBridge for WorkspaceTools {
             },
             ToolDefinition {
                 name: "edit_file".to_owned(),
-                description: "Replace exactly one matching text fragment in a workspace file. Include enough surrounding text to make old_text unique.".to_owned(),
+                description: "Create a missing workspace file when old_text is empty, or replace exactly one matching text fragment in an existing file. Include enough surrounding text to make old_text unique.".to_owned(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -173,7 +215,7 @@ impl ToolBridge for WorkspaceTools {
                         },
                         "old_text": {
                             "type": "string",
-                            "description": "Exact text to replace. It must occur exactly once."
+                            "description": "Exact text to replace. It must occur exactly once in an existing file. Use an empty string only to create a missing file."
                         },
                         "new_text": {
                             "type": "string",
@@ -190,6 +232,21 @@ impl ToolBridge for WorkspaceTools {
     fn execute(&self, call: ToolCall) -> impl Future<Output = ToolResult> + Send {
         self.execute_call(call)
     }
+}
+
+fn validate_relative_path(requested: &str) -> Result<&Path, String> {
+    let requested_path = Path::new(requested);
+    if requested_path.as_os_str().is_empty()
+        || requested_path.is_absolute()
+        || requested_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(
+            "tool paths must be relative to the workspace and may not contain ..".to_owned(),
+        );
+    }
+    Ok(requested_path)
 }
 
 fn parse_arguments<T>(arguments: &str, tool_name: &str) -> Result<T, String>
@@ -210,6 +267,19 @@ fn atomic_replace(path: &Path, content: String) -> io::Result<()> {
     temporary.write_all(content.as_bytes())?;
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn atomic_create(path: &Path, content: String) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("file has no parent directory"))?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(content.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -296,6 +366,42 @@ mod tests {
         assert_eq!(
             fs::read_to_string(directory.path().join("notes.txt")).unwrap(),
             "alpha\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_a_missing_file_from_an_empty_old_text() {
+        let directory = tempdir().unwrap();
+        let tools = WorkspaceTools::new(directory.path()).unwrap();
+
+        let create = tools
+            .execute(ToolCall {
+                id: "edit-1".to_owned(),
+                name: "edit_file".to_owned(),
+                arguments: r#"{"path":"hello.md","old_text":"","new_text":"hello\n"}"#.to_owned(),
+            })
+            .await;
+
+        assert!(!create.is_error);
+        assert!(create.content.contains(r#""created":true"#));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("hello.md")).unwrap(),
+            "hello\n"
+        );
+
+        let overwrite = tools
+            .execute(ToolCall {
+                id: "edit-2".to_owned(),
+                name: "edit_file".to_owned(),
+                arguments: r#"{"path":"hello.md","old_text":"","new_text":"replaced\n"}"#
+                    .to_owned(),
+            })
+            .await;
+        assert!(overwrite.is_error);
+        assert!(overwrite.content.contains("only be empty"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("hello.md")).unwrap(),
+            "hello\n"
         );
     }
 
