@@ -1,11 +1,15 @@
 # Nexa
 
-A lightweight, headless runtime for coordinated agent sessions.
+A small coding-agent harness in Rust.
 
-The current slice runs one local agent session through an OpenAI-compatible
-provider registry. Clients choose a provider and model for each message; the
-runtime records the user message, streamed response, tool activity, and terminal
-run state in one durable ordered event stream.
+Nexa currently ships one native harness implementation: an OpenAI-compatible
+provider adapter, agent loop, workspace tools, authoritative session runtime,
+server, and CLI client. Clients choose a provider and model for each message;
+the runtime component records the user message, streamed response, tool activity,
+and terminal run state in one durable ordered event stream.
+
+The native harness is part of Nexa rather than a replaceable plugin. Swapping in
+Pi or another harness implementation is not supported in the current slice.
 
 ## Workspace
 
@@ -36,7 +40,7 @@ useful for isolated development and tests.
 The CLI can add one OpenAI-compatible Chat Completions provider interactively:
 
 ```sh
-mise exec -- cargo run -p nexa-cli -- provider add
+cargo run -p nexa-cli -- provider add
 ```
 
 Running `nexa` with no configured providers starts the same setup automatically.
@@ -78,20 +82,20 @@ Install the exact Rust toolchain pinned for the project:
 mise install
 ```
 
-Configure a provider, then start the runtime:
+Configure a provider, then start the Nexa server:
 
 ```sh
-mise exec -- cargo run -p nexa-cli -- provider add
-mise exec -- cargo run -p nexa-server
+cargo run -p nexa-cli -- provider add
+cargo run -p nexa-server
 ```
 
 In another terminal, start the CLI:
 
 ```sh
-mise exec -- cargo run -p nexa-cli
+cargo run -p nexa-cli
 ```
 
-The CLI obtains the provider/model catalog from the runtime, asks you to choose
+The CLI obtains the provider/model catalog from the server, asks you to choose
 when more than one model is available, and streams each response. Type `/quit`
 to leave.
 
@@ -114,11 +118,11 @@ implicit overwrites, zero-match edits, and ambiguous edits are rejected.
 ## Verification
 
 ```sh
-mise exec -- cargo test --workspace
-mise exec -- cargo fmt --all --check
-mise exec -- cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 This slice intentionally does not include a TUI/native UI, multiple sessions,
 queued messages, steering, orchestration, OAuth, Anthropic Messages, OpenAI
-Responses, or a broader coding-tool suite.
+Responses, replaceable harness implementations, or a broader coding-tool suite.
