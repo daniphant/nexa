@@ -4,7 +4,10 @@ mod tools;
 
 use std::sync::Arc;
 
-pub use config::{ProviderConfig, ProviderConfigError, ProviderFile};
+pub use config::{
+    CredentialFile, CredentialFileError, ProviderConfig, ProviderConfigError, ProviderCredential,
+    ProviderFile,
+};
 use nexa_protocol::{ModelMessage, ModelRef, ToolCall, ToolDefinition, ToolResult};
 pub use openai::ProviderRegistry;
 use tokio::sync::mpsc;

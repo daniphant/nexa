@@ -1,34 +1,66 @@
 use std::{collections::BTreeMap, env};
 
 use futures_util::StreamExt;
-use nexa_protocol::{ModelMessage, ModelRef, ToolCall, ToolDefinition};
+use nexa_protocol::{ModelMessage, ModelRef, ProviderSummary, ToolCall, ToolDefinition};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    InferenceRequest, Provider, ProviderConfig, ProviderConfigError, ProviderEvent, ProviderFile,
+    CredentialFile, InferenceRequest, Provider, ProviderConfig, ProviderConfigError, ProviderEvent,
+    ProviderFile,
 };
 
 pub struct ProviderRegistry {
-    providers: BTreeMap<String, ProviderConfig>,
+    providers: BTreeMap<String, RegisteredProvider>,
 }
 
 impl ProviderRegistry {
     pub fn new(file: ProviderFile) -> Result<Self, ProviderConfigError> {
-        Ok(Self {
-            providers: file.validated_providers()?,
-        })
+        Self::with_credentials(file, &CredentialFile::default())
+    }
+
+    pub fn with_credentials(
+        file: ProviderFile,
+        credentials: &CredentialFile,
+    ) -> Result<Self, ProviderConfigError> {
+        let providers = file
+            .validated_providers()?
+            .into_iter()
+            .map(|(id, config)| {
+                let api_key = credentials.api_key(&id).map(str::to_owned);
+                (id, RegisteredProvider { config, api_key })
+            })
+            .collect();
+        Ok(Self { providers })
     }
 
     #[must_use]
     pub fn model_count(&self) -> usize {
         self.providers
             .values()
-            .map(|provider| provider.models.len())
+            .map(|provider| provider.config.models.len())
             .sum()
     }
+
+    #[must_use]
+    pub fn catalog(&self) -> Vec<ProviderSummary> {
+        self.providers
+            .iter()
+            .map(|(id, provider)| ProviderSummary {
+                id: id.clone(),
+                name: provider.config.name.clone(),
+                api_format: provider.config.api_format,
+                models: provider.config.models.clone(),
+            })
+            .collect()
+    }
+}
+
+struct RegisteredProvider {
+    config: ProviderConfig,
+    api_key: Option<String>,
 }
 
 impl Provider for ProviderRegistry {
@@ -37,7 +69,7 @@ impl Provider for ProviderRegistry {
             .providers
             .get(&model.provider)
             .ok_or_else(|| format!("unknown provider {:?}", model.provider))?;
-        if !provider.models.contains(&model.id) {
+        if !provider.config.models.contains(&model.id) {
             return Err(format!(
                 "provider {:?} does not offer model {:?}",
                 model.provider, model.id
@@ -56,9 +88,10 @@ impl Provider for ProviderRegistry {
         let Some(provider) = self.providers.get(&request.model.provider) else {
             return error_stream(format!("unknown provider {:?}", request.model.provider));
         };
-        let api_key = match &provider.api_key_env {
+        let api_key = match &provider.config.api_key_env {
             Some(variable) => match env::var(variable) {
                 Ok(value) if !value.trim().is_empty() => Some(value),
+                _ if provider.api_key.is_some() => provider.api_key.clone(),
                 _ => {
                     return error_stream(format!(
                         "provider {:?} requires authentication through {variable}",
@@ -66,9 +99,9 @@ impl Provider for ProviderRegistry {
                     ));
                 }
             },
-            None => None,
+            None => provider.api_key.clone(),
         };
-        OpenAiProvider::new(&provider.base_url, &request.model.id, api_key).stream(request)
+        OpenAiProvider::new(&provider.config.base_url, &request.model.id, api_key).stream(request)
     }
 }
 

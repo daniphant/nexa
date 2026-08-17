@@ -3,6 +3,29 @@ use serde_json::Value;
 
 pub const LOCAL_SESSION_ID: &str = "local";
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiFormat {
+    #[default]
+    ChatCompletions,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub api_format: ApiFormat,
+    pub models: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedCommand {
+    pub accepted: bool,
+    pub sequence: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {

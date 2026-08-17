@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, error::Error, fmt, fs, io, path::Path};
 
-use serde::Deserialize;
+use nexa_protocol::ApiFormat;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProviderFile {
     pub providers: BTreeMap<String, ProviderConfig>,
 }
@@ -11,6 +12,22 @@ impl ProviderFile {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProviderConfigError> {
         let contents = fs::read_to_string(path).map_err(ProviderConfigError::Read)?;
         toml::from_str(&contents).map_err(ProviderConfigError::Parse)
+    }
+
+    pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self, ProviderConfigError> {
+        match Self::load(path) {
+            Ok(file) => Ok(file),
+            Err(ProviderConfigError::Read(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(Self::default())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ProviderConfigError> {
+        self.clone().validated_providers()?;
+        let contents = toml::to_string_pretty(self).map_err(ProviderConfigError::Serialize)?;
+        write_file(path.as_ref(), contents.as_bytes(), false).map_err(ProviderConfigError::Write)
     }
 
     pub(crate) fn validated_providers(
@@ -23,18 +40,57 @@ impl ProviderFile {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderConfig {
+    pub name: String,
     pub base_url: String,
+    #[serde(default)]
+    pub api_format: ApiFormat,
     pub models: Vec<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CredentialFile {
+    pub providers: BTreeMap<String, ProviderCredential>,
+}
+
+impl CredentialFile {
+    pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self, CredentialFileError> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(CredentialFileError::Read(error)),
+        };
+        toml::from_str(&contents).map_err(CredentialFileError::Parse)
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), CredentialFileError> {
+        let contents = toml::to_string_pretty(self).map_err(CredentialFileError::Serialize)?;
+        write_file(path.as_ref(), contents.as_bytes(), true).map_err(CredentialFileError::Write)
+    }
+
+    #[must_use]
+    pub fn api_key(&self, provider: &str) -> Option<&str> {
+        self.providers
+            .get(provider)
+            .map(|credentials| credentials.api_key.as_str())
+            .filter(|api_key| !api_key.trim().is_empty())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderCredential {
+    pub api_key: String,
+}
+
 #[derive(Debug)]
 pub enum ProviderConfigError {
     Read(io::Error),
+    Write(io::Error),
     Parse(toml::de::Error),
+    Serialize(toml::ser::Error),
     InvalidProvider { name: String, reason: String },
 }
 
@@ -42,7 +98,11 @@ impl fmt::Display for ProviderConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Read(error) => write!(formatter, "could not read provider registry: {error}"),
+            Self::Write(error) => write!(formatter, "could not write provider registry: {error}"),
             Self::Parse(error) => write!(formatter, "invalid provider registry: {error}"),
+            Self::Serialize(error) => {
+                write!(formatter, "could not serialize provider registry: {error}")
+            }
             Self::InvalidProvider { name, reason } => {
                 write!(formatter, "provider {name:?} is invalid: {reason}")
             }
@@ -53,14 +113,50 @@ impl fmt::Display for ProviderConfigError {
 impl Error for ProviderConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Read(error) => Some(error),
+            Self::Read(error) | Self::Write(error) => Some(error),
             Self::Parse(error) => Some(error),
+            Self::Serialize(error) => Some(error),
             Self::InvalidProvider { .. } => None,
         }
     }
 }
 
+#[derive(Debug)]
+pub enum CredentialFileError {
+    Read(io::Error),
+    Write(io::Error),
+    Parse(toml::de::Error),
+    Serialize(toml::ser::Error),
+}
+
+impl fmt::Display for CredentialFileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => write!(formatter, "could not read credentials: {error}"),
+            Self::Write(error) => write!(formatter, "could not write credentials: {error}"),
+            Self::Parse(error) => write!(formatter, "invalid credentials file: {error}"),
+            Self::Serialize(error) => write!(formatter, "could not serialize credentials: {error}"),
+        }
+    }
+}
+
+impl Error for CredentialFileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) | Self::Write(error) => Some(error),
+            Self::Parse(error) => Some(error),
+            Self::Serialize(error) => Some(error),
+        }
+    }
+}
+
 fn validate_provider(name: &str, provider: &ProviderConfig) -> Result<(), ProviderConfigError> {
+    if name.trim().is_empty() || provider.name.trim().is_empty() {
+        return Err(ProviderConfigError::InvalidProvider {
+            name: name.to_owned(),
+            reason: "provider ID and name must not be empty".to_owned(),
+        });
+    }
     if provider.base_url.trim().is_empty() {
         return Err(ProviderConfigError::InvalidProvider {
             name: name.to_owned(),
@@ -76,19 +172,53 @@ fn validate_provider(name: &str, provider: &ProviderConfig) -> Result<(), Provid
     Ok(())
 }
 
+fn write_file(path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(contents)
+    })?;
+
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ProviderFile;
+    use std::{collections::BTreeMap, fs};
+
+    use nexa_protocol::ApiFormat;
+    use tempfile::tempdir;
+
+    use super::{CredentialFile, ProviderConfig, ProviderCredential, ProviderFile};
 
     #[test]
     fn allows_two_providers_to_offer_the_same_model() {
         let file: ProviderFile = toml::from_str(
             r#"
                 [providers.one]
+                name = "One"
                 base_url = "https://one.example/v1"
                 models = ["shared-model"]
 
                 [providers.two]
+                name = "Two"
                 base_url = "https://two.example/v1"
                 models = ["shared-model"]
             "#,
@@ -98,5 +228,57 @@ mod tests {
         let providers = file.validated_providers().unwrap();
         assert!(providers["one"].models.contains(&"shared-model".to_owned()));
         assert!(providers["two"].models.contains(&"shared-model".to_owned()));
+    }
+
+    #[test]
+    fn keeps_credentials_out_of_the_provider_registry() {
+        let directory = tempdir().unwrap();
+        let provider_path = directory.path().join("providers.toml");
+        let credentials_path = directory.path().join("credentials.toml");
+        ProviderFile {
+            providers: BTreeMap::from([(
+                "deepseek".to_owned(),
+                ProviderConfig {
+                    name: "DeepSeek".to_owned(),
+                    base_url: "https://api.example/v1".to_owned(),
+                    api_format: ApiFormat::ChatCompletions,
+                    models: vec!["deepseek-chat".to_owned()],
+                    api_key_env: None,
+                },
+            )]),
+        }
+        .save(&provider_path)
+        .unwrap();
+        CredentialFile {
+            providers: BTreeMap::from([(
+                "deepseek".to_owned(),
+                ProviderCredential {
+                    api_key: "secret-key".to_owned(),
+                },
+            )]),
+        }
+        .save(&credentials_path)
+        .unwrap();
+
+        assert!(
+            !fs::read_to_string(provider_path)
+                .unwrap()
+                .contains("secret-key")
+        );
+        assert_eq!(
+            CredentialFile::load_or_default(&credentials_path)
+                .unwrap()
+                .api_key("deepseek"),
+            Some("secret-key")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(credentials_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

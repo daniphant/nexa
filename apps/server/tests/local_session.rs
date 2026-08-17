@@ -1,7 +1,7 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
 use nexa_harness::{Agent, AgentEvent, AgentRequest};
-use nexa_protocol::{Command, Event, ModelRef};
+use nexa_protocol::{ApiFormat, Command, Event, ModelRef, ProviderSummary};
 use nexa_runtime::LocalSession;
 use reqwest::{Client, Response, StatusCode};
 use tempfile::tempdir;
@@ -118,6 +118,39 @@ async fn rejects_an_unknown_provider_model_pair_before_recording_it() -> TestRes
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(tokio::fs::read_to_string(event_log_path).await?.is_empty());
 
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn exposes_the_runtime_provider_catalog() -> TestResult {
+    let directory = tempdir()?;
+    let session = LocalSession::open(directory.path().join("local.ndjson")).await?;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let catalog = vec![ProviderSummary {
+        id: "deepseek".to_owned(),
+        name: "DeepSeek".to_owned(),
+        api_format: ApiFormat::ChatCompletions,
+        models: vec!["deepseek-chat".to_owned()],
+    }];
+    let server = tokio::spawn(async move {
+        nexa_server::serve_with_catalog(listener, session, catalog)
+            .await
+            .expect("test server should remain available");
+    });
+
+    let providers = Client::new()
+        .get(format!("{base_url}/providers"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<ProviderSummary>>()
+        .await?;
+
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].id, "deepseek");
+    assert_eq!(providers[0].models, ["deepseek-chat"]);
     server.abort();
     Ok(())
 }
