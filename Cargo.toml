@@ -2,9 +2,11 @@
 members = [
     "apps/cli",
     "apps/server",
+    "crates/client",
     "crates/harness",
     "crates/protocol",
     "crates/runtime",
+    "crates/tui",
 ]
 resolver = "3"
 
@@ -15,11 +17,15 @@ version = "0.1.0"
 
 [workspace.dependencies]
 axum = { version = "=0.8.9", features = ["json"] }
+crossterm = { version = "=0.29.0", features = ["event-stream"] }
 dirs = "=6.0.0"
 futures-util = "=0.3.34"
+nexa-client = { path = "crates/client" }
 nexa-harness = { path = "crates/harness" }
 nexa-protocol = { path = "crates/protocol" }
 nexa-runtime = { path = "crates/runtime" }
+nexa-tui = { path = "crates/tui" }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
 rpassword = "=7.5.4"
 serde = { version = "=1.0.229", features = ["derive"] }

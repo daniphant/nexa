@@ -13,11 +13,13 @@ Pi or another harness implementation is not supported in the current slice.
 
 ## Workspace
 
-- `apps/cli` owns provider setup and the interactive terminal client.
+- `apps/cli` owns provider setup and the `nexa` command entry point.
 - `apps/server` owns the local HTTP/SSE process.
+- `crates/client` is the typed Rust client for commands, provider discovery, and events.
 - `crates/protocol` defines commands, events, model references, and tool wire types.
 - `crates/runtime` owns the authoritative session and durable event stream.
 - `crates/harness` owns the provider adapter, inference loop, and tool bridge.
+- `crates/tui` owns the fullscreen terminal UI and its local presentation state.
 
 Inference and tools run outside the session actor. Their normalized events are
 sent back to the actor before being appended to `~/.nexa/sessions/local.ndjson`
@@ -95,9 +97,18 @@ In another terminal, start the CLI:
 cargo run -p nexa-cli
 ```
 
-The CLI obtains the provider/model catalog from the server, asks you to choose
-when more than one model is available, and streams each response. Type `/quit`
-to leave.
+Running `nexa` opens a fullscreen terminal UI for the current local session. It
+replays the durable transcript, streams assistant text, shows compact tool
+activity, and asks you to choose when more than one provider/model pair is
+available.
+
+The terminal UI uses these controls:
+
+- `Enter` sends the current one-line message.
+- `Ctrl+M` opens the provider/model picker.
+- `Page Up`, `Page Down`, arrow keys, or the mouse wheel scroll the transcript.
+- `Ctrl+U` clears the composer.
+- `Ctrl+C`, `/quit`, or `/exit` leaves Nexa.
 
 The HTTP protocol remains available to every future client. Watch the replayable
 event stream with:
@@ -123,6 +134,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-This slice intentionally does not include a TUI/native UI, multiple sessions,
-queued messages, steering, orchestration, OAuth, Anthropic Messages, OpenAI
-Responses, replaceable harness implementations, or a broader coding-tool suite.
+This slice intentionally does not include a session browser, queue UI, multiple
+sessions, steering, orchestration, a native app, OAuth, Anthropic Messages,
+OpenAI Responses, replaceable harness implementations, or a broader coding-tool
+suite.

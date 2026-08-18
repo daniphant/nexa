@@ -1,20 +1,15 @@
 [package]
-name = "nexa-cli"
+name = "nexa-tui"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "nexa"
-path = "src/main.rs"
-
 [dependencies]
-dirs.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
 nexa-client.workspace = true
-nexa-harness.workspace = true
 nexa-protocol.workspace = true
-nexa-tui.workspace = true
-rpassword.workspace = true
+ratatui.workspace = true
 tokio.workspace = true
 
 [lints]
