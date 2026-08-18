@@ -62,6 +62,7 @@ fn print_help() {
            NEXA_SERVER_URL       Runtime URL (default: http://127.0.0.1:4123)\n  \
            NEXA_PORT             Default local server port (default: 4123)\n  \
            NEXA_HOME             Nexa state directory (default: ~/.nexa)\n  \
+           NEXA_WORKSPACE        Workspace to open (default: current directory)\n  \
            NEXA_PROVIDER_FILE    Override the provider registry path\n  \
            NEXA_CREDENTIALS_FILE Override the credential store path"
     );
@@ -124,6 +125,14 @@ async fn chat() -> CliResult {
     if configured_server_url.is_none() {
         ensure_local_server(&client).await?;
     }
+    let workspace = env::var_os("NEXA_WORKSPACE")
+        .map(PathBuf::from)
+        .map_or_else(env::current_dir, Ok)?;
+    let workspace = workspace
+        .to_str()
+        .ok_or("the current workspace path must be UTF-8")?;
+    let session = client.open_workspace(workspace).await?;
+    let client = client.with_session(session.id);
     nexa_tui::run(client).await?;
     Ok(())
 }

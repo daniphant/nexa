@@ -1,6 +1,8 @@
 use std::{error::Error, fmt, str::Utf8Error};
 
-use nexa_protocol::{AcceptedCommand, Command, Event, ModelRef, ProviderSummary};
+use nexa_protocol::{
+    AcceptedCommand, Command, Event, ModelRef, OpenSessionRequest, ProviderSummary, SessionInfo,
+};
 use reqwest::{Client, Response, StatusCode};
 
 #[derive(Clone)]
@@ -8,6 +10,7 @@ pub struct NexaClient {
     http: Client,
     server_url: String,
     client_id: String,
+    session_id: Option<String>,
 }
 
 impl NexaClient {
@@ -17,7 +20,14 @@ impl NexaClient {
             http: Client::new(),
             server_url: server_url.into(),
             client_id: client_id.into(),
+            session_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 
     pub async fn providers(&self) -> Result<Vec<ProviderSummary>, ClientError> {
@@ -26,8 +36,29 @@ impl NexaClient {
         Ok(response.json().await?)
     }
 
+    pub async fn open_workspace(
+        &self,
+        workspace: impl Into<String>,
+    ) -> Result<SessionInfo, ClientError> {
+        let response = self
+            .http
+            .post(self.endpoint("/sessions/open"))
+            .json(&OpenSessionRequest {
+                workspace: workspace.into(),
+            })
+            .send()
+            .await?;
+        let response = accepted_response(response).await?;
+        Ok(response.json().await?)
+    }
+
     pub async fn subscribe(&self) -> Result<EventStream, ClientError> {
-        let response = self.http.get(self.endpoint("/events")).send().await?;
+        let session_id = self.session_id()?;
+        let response = self
+            .http
+            .get(self.endpoint(&format!("/sessions/{session_id}/events")))
+            .send()
+            .await?;
         Ok(EventStream::new(accepted_response(response).await?))
     }
 
@@ -36,10 +67,12 @@ impl NexaClient {
         model: ModelRef,
         text: impl Into<String>,
     ) -> Result<AcceptedCommand, ClientError> {
+        let session_id = self.session_id()?.to_owned();
         let response = self
             .http
             .post(self.endpoint("/commands"))
             .json(&Command::SendMessage {
+                session_id,
                 client_id: self.client_id.clone(),
                 model,
                 text: text.into(),
@@ -52,6 +85,12 @@ impl NexaClient {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.server_url.trim_end_matches('/'))
+    }
+
+    fn session_id(&self) -> Result<&str, ClientError> {
+        self.session_id
+            .as_deref()
+            .ok_or(ClientError::SessionNotSelected)
     }
 }
 
@@ -132,6 +171,7 @@ pub enum ClientError {
     InvalidEvent(serde_json::Error),
     InvalidUtf8(Utf8Error),
     Rejected { status: StatusCode, body: String },
+    SessionNotSelected,
     StreamClosed,
 }
 
@@ -151,6 +191,7 @@ impl fmt::Display for ClientError {
             Self::Rejected { status, body } => {
                 write!(formatter, "runtime rejected the request ({status}): {body}")
             }
+            Self::SessionNotSelected => formatter.write_str("no Nexa session is selected"),
             Self::StreamClosed => formatter.write_str("runtime event stream closed"),
         }
     }
@@ -162,7 +203,7 @@ impl Error for ClientError {
             Self::Http(error) => Some(error),
             Self::InvalidEvent(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
-            Self::Rejected { .. } | Self::StreamClosed => None,
+            Self::Rejected { .. } | Self::SessionNotSelected | Self::StreamClosed => None,
         }
     }
 }
