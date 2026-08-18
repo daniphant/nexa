@@ -1,8 +1,11 @@
 use std::{
     env,
     error::Error,
+    fs::{self, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::Duration,
 };
 
 use nexa_client::NexaClient;
@@ -57,6 +60,7 @@ fn print_help() {
            nexa chat          Open the fullscreen terminal UI\n\n\
          Environment:\n  \
            NEXA_SERVER_URL       Runtime URL (default: http://127.0.0.1:4123)\n  \
+           NEXA_PORT             Default local server port (default: 4123)\n  \
            NEXA_HOME             Nexa state directory (default: ~/.nexa)\n  \
            NEXA_PROVIDER_FILE    Override the provider registry path\n  \
            NEXA_CREDENTIALS_FILE Override the credential store path"
@@ -112,12 +116,102 @@ fn add_provider() -> CliResult {
 }
 
 async fn chat() -> CliResult {
-    let server_url =
-        env::var("NEXA_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:4123".to_owned());
+    let configured_server_url = env::var("NEXA_SERVER_URL").ok();
+    let server_url = configured_server_url
+        .clone()
+        .unwrap_or_else(default_server_url);
     let client = NexaClient::new(server_url, format!("cli-{}", std::process::id()));
+    if configured_server_url.is_none() {
+        ensure_local_server(&client).await?;
+    }
     nexa_tui::run(client).await?;
     Ok(())
 }
+
+fn default_server_url() -> String {
+    let port = env::var("NEXA_PORT").unwrap_or_else(|_| "4123".to_owned());
+    format!("http://127.0.0.1:{port}")
+}
+
+async fn ensure_local_server(client: &NexaClient) -> CliResult {
+    match client.providers().await {
+        Ok(_) => return Ok(()),
+        Err(error) if error.is_connect() => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let log_path = nexa_home()?.join("logs/server.log");
+    println!("Starting Nexa server…");
+    let mut server = spawn_server(&log_path)?;
+
+    for _ in 0..50 {
+        if let Some(status) = server.try_wait()? {
+            return Err(format!(
+                "nexa-server exited with {status}; see {}",
+                log_path.display()
+            )
+            .into());
+        }
+        match client.providers().await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.is_connect() => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(format!(
+        "nexa-server did not become ready; see {}",
+        log_path.display()
+    )
+    .into())
+}
+
+fn spawn_server(log_path: &Path) -> CliResult<Child> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let errors = log.try_clone()?;
+    let mut command = Command::new(server_binary()?);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(errors));
+    detach(&mut command);
+    command.spawn().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not start nexa-server: {error}"),
+        )
+        .into()
+    })
+}
+
+fn server_binary() -> CliResult<PathBuf> {
+    let current_executable = env::current_exe()?;
+    let sibling =
+        current_executable.with_file_name(format!("nexa-server{}", env::consts::EXE_SUFFIX));
+    if sibling.is_file() {
+        Ok(sibling)
+    } else {
+        Ok(PathBuf::from("nexa-server"))
+    }
+}
+
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach(_command: &mut Command) {}
 
 fn prompt_required(label: &str) -> io::Result<String> {
     loop {

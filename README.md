@@ -76,6 +76,19 @@ without authentication can omit both.
 
 Set `NEXA_WORKSPACE` to change the directory exposed to tools.
 
+## Install from this checkout
+
+Install or update both release binaries in Cargo's executable directory:
+
+```sh
+cargo install --locked --force --path apps/server
+cargo install --locked --force --path apps/cli
+```
+
+With Cargo's executable directory on `PATH`, `nexa` and `nexa-server` are then
+available from every directory. Re-run the commands after making local changes
+that you want reflected in the installed binaries.
+
 ## Run the active session
 
 Install the exact Rust toolchain pinned for the project:
@@ -84,14 +97,13 @@ Install the exact Rust toolchain pinned for the project:
 mise install
 ```
 
-Configure a provider, then start the Nexa server:
+Configure a provider:
 
 ```sh
 cargo run -p nexa-cli -- provider add
-cargo run -p nexa-server
 ```
 
-In another terminal, start the CLI:
+Then start the CLI:
 
 ```sh
 cargo run -p nexa-cli
@@ -100,7 +112,12 @@ cargo run -p nexa-cli
 Running `nexa` opens a fullscreen terminal UI for the current local session. It
 replays the durable transcript, streams assistant text, shows compact tool
 activity, and asks you to choose when more than one provider/model pair is
-available.
+available. When the default local server is not running, the CLI starts
+`nexa-server` as a detached background process and waits for it to become ready.
+Server output is appended to `~/.nexa/logs/server.log`.
+
+An explicit `NEXA_SERVER_URL` remains externally managed and is never replaced
+by an automatically started local server.
 
 The terminal UI uses these controls:
 

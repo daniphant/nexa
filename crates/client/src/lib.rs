@@ -135,6 +135,13 @@ pub enum ClientError {
     StreamClosed,
 }
 
+impl ClientError {
+    #[must_use]
+    pub fn is_connect(&self) -> bool {
+        matches!(self, Self::Http(error) if error.is_connect())
+    }
+}
+
 impl fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -6,8 +6,8 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let port = env::var("PORT")
-        .or_else(|_| env::var("NEXA_PORT"))
+    let port = env::var("NEXA_PORT")
+        .or_else(|_| env::var("PORT"))
         .unwrap_or_else(|_| "4123".to_owned())
         .parse::<u16>()?;
     let nexa_home = env::var_os("NEXA_HOME")
