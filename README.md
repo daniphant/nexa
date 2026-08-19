@@ -13,15 +13,19 @@ Pi or another harness implementation is not supported in the current slice.
 
 ## Workspace
 
-- `apps/cli` owns provider setup and the interactive terminal client.
+- `apps/cli` owns provider setup and the `nexa` command entry point.
 - `apps/server` owns the local HTTP/SSE process.
+- `crates/client` is the typed Rust client for commands, provider discovery, and events.
 - `crates/protocol` defines commands, events, model references, and tool wire types.
 - `crates/runtime` owns the authoritative session and durable event stream.
 - `crates/harness` owns the provider adapter, inference loop, and tool bridge.
+- `crates/tui` owns the fullscreen terminal UI and its local presentation state.
 
-Inference and tools run outside the session actor. Their normalized events are
-sent back to the actor before being appended to `~/.nexa/sessions/local.ndjson`
-and broadcast to clients.
+Inference and tools run outside each session actor. Their normalized events are
+sent back to the actor before being appended to that session's event log and
+broadcast to clients. A server-owned session registry binds each default session
+to one canonical workspace, so the background server is independent of its own
+working directory.
 
 ## Nexa home
 
@@ -29,11 +33,14 @@ Nexa keeps user-level state under `~/.nexa` by default:
 
 - `provider.toml` contains provider names, endpoints, API formats, and models.
 - `credentials.toml` contains API keys and is written with `0600` permissions on Unix.
-- `sessions/local.ndjson` is the durable event stream for the current local session.
+- `server.token` authenticates clients to the local server and is written with
+  `0600` permissions on Unix.
+- `sessions/<session-id>/session.json` stores the immutable workspace binding.
+- `sessions/<session-id>/events.ndjson` is that session's durable event stream.
 
 Set `NEXA_HOME` to move the complete state directory. The more specific
-`NEXA_PROVIDER_FILE`, `NEXA_CREDENTIALS_FILE`, and `NEXA_SESSIONS_DIR` overrides are
-useful for isolated development and tests.
+`NEXA_PROVIDER_FILE`, `NEXA_CREDENTIALS_FILE`, `NEXA_SERVER_TOKEN_FILE`, and
+`NEXA_SESSIONS_DIR` overrides are useful for isolated development and tests.
 
 ## Provider registry
 
@@ -72,39 +79,82 @@ For hand-written configuration, `api_key_env` remains available as an alternativ
 to the credential store. Environment credentials take precedence. Providers
 without authentication can omit both.
 
-Set `NEXA_WORKSPACE` to change the directory exposed to tools.
+Set `NEXA_WORKSPACE` before starting the CLI to select a workspace other than
+the CLI's current directory. The CLI sends that directory when it opens the
+workspace's default session; the long-lived server never uses its own current
+directory as a tool root.
 
-## Run the active session
+## Install from this checkout
 
-Install the exact Rust toolchain pinned for the project:
+Install the pinned toolchain, then install or update both release binaries in
+Cargo's executable directory:
 
 ```sh
 mise install
+cargo install --locked --force --path apps/server
+cargo install --locked --force --path apps/cli
 ```
 
-Configure a provider, then start the Nexa server:
+With Cargo's executable directory on `PATH`, `nexa` and `nexa-server` are then
+available from every directory. Re-run the commands after making local changes
+that you want reflected in the installed binaries.
+
+## Run the active session
+
+Configure a provider:
 
 ```sh
 cargo run -p nexa-cli -- provider add
-cargo run -p nexa-server
 ```
 
-In another terminal, start the CLI:
+Then start the CLI:
 
 ```sh
 cargo run -p nexa-cli
 ```
 
-The CLI obtains the provider/model catalog from the server, asks you to choose
-when more than one model is available, and streams each response. Type `/quit`
-to leave.
+Running `nexa` opens a fullscreen terminal UI for the current workspace's
+default session. It replays the durable transcript, streams assistant text,
+shows compact tool activity, and asks you to choose when more than one
+provider/model pair is available. When the default local server is not running,
+the CLI starts `nexa-server` as a detached background process and waits for it
+to become ready. Server output is appended to `$NEXA_HOME/logs/server.log`,
+which defaults to `~/.nexa/logs/server.log`.
 
-The HTTP protocol remains available to every future client. Watch the replayable
-event stream with:
+An explicit `NEXA_SERVER_URL` remains externally managed and is never replaced
+by an automatically started local server. Set `NEXA_SERVER_TOKEN` when that
+server requires bearer authentication.
+
+The terminal UI uses these controls:
+
+- `Enter` sends the current one-line message.
+- `F2` opens the provider/model picker.
+- `Page Up`, `Page Down`, arrow keys, or the mouse wheel scroll the transcript.
+- `Ctrl+U` clears the composer.
+- `Ctrl+C`, `/quit`, or `/exit` leaves Nexa.
+
+The HTTP protocol remains available to every future client. Local clients read
+the owner-only server token and send it as a bearer token. To open the default
+session for a workspace manually:
 
 ```sh
-curl -N http://127.0.0.1:4123/events
+token_file="${NEXA_SERVER_TOKEN_FILE:-${NEXA_HOME:-$HOME/.nexa}/server.token}"
+read -r nexa_server_token < "$token_file"
+curl -X POST http://127.0.0.1:4123/sessions/open \
+  -H "authorization: Bearer $nexa_server_token" \
+  -H 'content-type: application/json' \
+  -d '{"workspace":"/absolute/path/to/workspace"}'
+unset nexa_server_token token_file
 ```
+
+The response contains a stable session ID. Its replayable event stream is
+`GET /sessions/<session-id>/events`, and commands sent to `POST /commands`
+include that `sessionId`.
+
+On first use after upgrading from the original singleton runtime, Nexa assigns
+the legacy `sessions/local.ndjson` history to the first workspace opened and
+keeps the original as `sessions/local.ndjson.migrated`. A malformed legacy log
+is moved to `sessions/local.ndjson.corrupt` instead of blocking every workspace.
 
 The harness currently exposes exactly two workspace-scoped tools:
 
@@ -123,6 +173,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-This slice intentionally does not include a TUI/native UI, multiple sessions,
-queued messages, steering, orchestration, OAuth, Anthropic Messages, OpenAI
-Responses, replaceable harness implementations, or a broader coding-tool suite.
+This slice intentionally does not include a session browser, multiple named
+sessions per workspace, queue UI, steering, orchestration, a native app, OAuth,
+Anthropic Messages, OpenAI Responses, replaceable harness implementations, or a
+broader coding-tool suite.

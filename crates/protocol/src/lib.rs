@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const LOCAL_SESSION_ID: &str = "local";
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiFormat {
@@ -21,6 +19,19 @@ pub struct ProviderSummary {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OpenSessionRequest {
+    pub workspace: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub id: String,
+    pub workspace: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcceptedCommand {
     pub accepted: bool,
     pub sequence: u64,
@@ -30,6 +41,8 @@ pub struct AcceptedCommand {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     SendMessage {
+        #[serde(rename = "sessionId")]
+        session_id: String,
         #[serde(rename = "clientId")]
         client_id: String,
         model: ModelRef,

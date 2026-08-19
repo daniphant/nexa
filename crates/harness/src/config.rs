@@ -1,7 +1,89 @@
-use std::{collections::BTreeMap, error::Error, fmt, fs, io, path::Path};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt::{self, Write as _},
+    fs, io,
+    path::Path,
+};
 
 use nexa_protocol::ApiFormat;
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
+
+const SERVER_TOKEN_BYTES: usize = 32;
+
+pub fn load_or_create_server_token(path: impl AsRef<Path>) -> io::Result<String> {
+    let path = path.as_ref();
+    match read_server_token(path) {
+        Ok(token) => return Ok(token),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::other("server token path has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+
+    let mut random = [0_u8; SERVER_TOKEN_BYTES];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    let mut token = String::with_capacity(SERVER_TOKEN_BYTES * 2);
+    for byte in random {
+        write!(&mut token, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    set_private_permissions(temporary.as_file())?;
+    {
+        use std::io::Write;
+        temporary.write_all(token.as_bytes())?;
+    }
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {
+            set_private_path_permissions(path)?;
+            Ok(token)
+        }
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => read_server_token(path),
+        Err(error) => Err(error.error),
+    }
+}
+
+fn read_server_token(path: &Path) -> io::Result<String> {
+    let token = fs::read_to_string(path)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server token file is empty",
+        ));
+    }
+    set_private_path_permissions(path)?;
+    Ok(token.to_owned())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_path_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_path_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProviderFile {
@@ -201,12 +283,53 @@ fn write_file(path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use nexa_protocol::ApiFormat;
     use tempfile::tempdir;
 
-    use super::{CredentialFile, ProviderConfig, ProviderCredential, ProviderFile};
+    use super::{
+        CredentialFile, ProviderConfig, ProviderCredential, ProviderFile, SERVER_TOKEN_BYTES,
+        load_or_create_server_token,
+    };
+
+    #[test]
+    fn concurrent_server_token_creation_returns_one_private_token() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("server.token");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    load_or_create_server_token(path).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let tokens = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(tokens[0], tokens[1]);
+        assert_eq!(tokens[0].len(), SERVER_TOKEN_BYTES * 2);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[test]
     fn allows_two_providers_to_offer_the_same_model() {

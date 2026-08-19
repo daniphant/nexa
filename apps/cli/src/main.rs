@@ -1,13 +1,18 @@
 use std::{
     env,
     error::Error,
+    fs::{self, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::Duration,
 };
 
-use nexa_harness::{CredentialFile, ProviderConfig, ProviderCredential, ProviderFile};
-use nexa_protocol::{AcceptedCommand, ApiFormat, Command, Event, ModelRef, ProviderSummary};
-use reqwest::{Client, Response};
+use nexa_client::NexaClient;
+use nexa_harness::{
+    CredentialFile, ProviderConfig, ProviderCredential, ProviderFile, load_or_create_server_token,
+};
+use nexa_protocol::ApiFormat;
 
 type CliResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -52,11 +57,16 @@ fn print_help() {
     println!(
         "Nexa CLI\n\n\
          Usage:\n  \
+           nexa               Open the fullscreen terminal UI\n  \
            nexa provider add  Configure an OpenAI-compatible provider\n  \
-           nexa chat          Chat through the running Nexa runtime\n\n\
+           nexa chat          Open the fullscreen terminal UI\n\n\
          Environment:\n  \
            NEXA_SERVER_URL       Runtime URL (default: http://127.0.0.1:4123)\n  \
+           NEXA_PORT             Default local server port (default: 4123)\n  \
            NEXA_HOME             Nexa state directory (default: ~/.nexa)\n  \
+           NEXA_WORKSPACE        Workspace to open (default: current directory)\n  \
+           NEXA_SERVER_TOKEN     Authentication token for an explicit server\n  \
+           NEXA_SERVER_TOKEN_FILE Override the local server token path\n  \
            NEXA_PROVIDER_FILE    Override the provider registry path\n  \
            NEXA_CREDENTIALS_FILE Override the credential store path"
     );
@@ -111,202 +121,121 @@ fn add_provider() -> CliResult {
 }
 
 async fn chat() -> CliResult {
-    let server_url =
-        env::var("NEXA_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:4123".to_owned());
-    let client = Client::new();
-    let providers = client
-        .get(endpoint(&server_url, "/providers"))
-        .send()
-        .await
-        .map_err(|error| format!("could not reach the Nexa runtime at {server_url}: {error}"))?
-        .error_for_status()?
-        .json::<Vec<ProviderSummary>>()
-        .await?;
-    let (provider, model) = select_model(&providers)?;
-
-    println!(
-        "Using {} / {} ({})\nType /quit to leave.\n",
-        provider.name, model, provider.id
-    );
-
-    loop {
-        let message = prompt("you> ")?;
-        let message = message.trim();
-        if message == "/quit" || message == "/exit" {
-            break;
-        }
-        if message.is_empty() {
-            continue;
-        }
-
-        run_turn(&client, &server_url, &provider.id, &model, message).await?;
+    let configured_server_url = env::var("NEXA_SERVER_URL").ok();
+    let server_url = configured_server_url
+        .clone()
+        .unwrap_or_else(default_server_url);
+    let mut client = NexaClient::new(server_url, format!("cli-{}", std::process::id()));
+    if let Some(token) = server_token(configured_server_url.is_none())? {
+        client = client.with_token(token);
     }
+    if configured_server_url.is_none() {
+        ensure_local_server(&client).await?;
+    }
+    let workspace = env::var_os("NEXA_WORKSPACE")
+        .map(PathBuf::from)
+        .map_or_else(env::current_dir, Ok)?;
+    let workspace = workspace
+        .to_str()
+        .ok_or("the current workspace path must be UTF-8")?;
+    let session = client.open_workspace(workspace).await?;
+    let client = client.with_session(session.id);
+    nexa_tui::run(client).await?;
     Ok(())
 }
 
-fn select_model(providers: &[ProviderSummary]) -> CliResult<(ProviderSummary, String)> {
-    let choices = providers
-        .iter()
-        .flat_map(|provider| {
-            provider
-                .models
-                .iter()
-                .map(move |model| (provider.clone(), model.clone()))
-        })
-        .collect::<Vec<_>>();
-
-    if choices.is_empty() {
-        return Err("the runtime has no configured models; run `nexa provider add` first".into());
-    }
-    if choices.len() == 1 {
-        return Ok(choices[0].clone());
-    }
-
-    println!("Choose a model:");
-    for (index, (provider, model)) in choices.iter().enumerate() {
-        println!(
-            "  {}. {} / {} ({})",
-            index + 1,
-            provider.name,
-            model,
-            provider.id
-        );
-    }
-    loop {
-        let selection = prompt_required("Selection")?;
-        if let Ok(index) = selection.parse::<usize>()
-            && let Some(choice) = index.checked_sub(1).and_then(|index| choices.get(index))
-        {
-            return Ok(choice.clone());
-        }
-        eprintln!("Choose a number from 1 to {}.", choices.len());
-    }
+fn default_server_url() -> String {
+    let port = env::var("NEXA_PORT").unwrap_or_else(|_| "4123".to_owned());
+    format!("http://127.0.0.1:{port}")
 }
 
-async fn run_turn(
-    client: &Client,
-    server_url: &str,
-    provider: &str,
-    model: &str,
-    text: &str,
-) -> CliResult {
-    let event_response = client
-        .get(endpoint(server_url, "/events"))
-        .send()
-        .await?
-        .error_for_status()?;
-    let mut events = EventReader::new(event_response);
-
-    let response = client
-        .post(endpoint(server_url, "/commands"))
-        .json(&Command::SendMessage {
-            client_id: format!("cli-{}", std::process::id()),
-            model: ModelRef {
-                provider: provider.to_owned(),
-                id: model.to_owned(),
-            },
-            text: text.to_owned(),
-        })
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await?;
-        return Err(format!("runtime rejected the message ({status}): {body}").into());
+async fn ensure_local_server(client: &NexaClient) -> CliResult {
+    match client.providers().await {
+        Ok(_) => return Ok(()),
+        Err(error) if error.is_connect() => {}
+        Err(error) => return Err(error.into()),
     }
-    let accepted = response.json::<AcceptedCommand>().await?;
 
-    print!("assistant> ");
-    io::stdout().flush()?;
-    let mut saw_delta = false;
-    loop {
-        let event = events.next().await?;
-        if event.sequence() <= accepted.sequence {
-            continue;
+    let log_path = nexa_home()?.join("logs/server.log");
+    println!("Starting Nexa server…");
+    let mut server = spawn_server(&log_path)?;
+    let mut exit_status = None;
+
+    for _ in 0..50 {
+        if exit_status.is_none() {
+            exit_status = server.try_wait()?;
         }
-        match event {
-            Event::AssistantTextDelta { text, .. } => {
-                saw_delta = true;
-                print!("{text}");
-                io::stdout().flush()?;
+        match client.providers().await {
+            Ok(_) => return Ok(()),
+            Err(error) if error.is_connect() => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Event::AssistantMessage { text, .. } if !saw_delta => {
-                print!("{text}");
-                io::stdout().flush()?;
+            Err(error) => {
+                stop_child(&mut server);
+                return Err(error.into());
             }
-            Event::ToolCallStarted { call, .. } => {
-                println!("\n[tool: {}]", call.name);
-                print!("assistant> ");
-                io::stdout().flush()?;
-            }
-            Event::RunCompleted { .. } => {
-                println!();
-                return Ok(());
-            }
-            Event::RunFailed { error, .. } => {
-                println!();
-                return Err(io::Error::other(format!("agent run failed: {error}")).into());
-            }
-            Event::Message { .. }
-            | Event::RunStarted { .. }
-            | Event::AssistantMessage { .. }
-            | Event::ToolCallCompleted { .. } => {}
-        }
-    }
-}
-
-struct EventReader {
-    response: Response,
-    buffer: String,
-}
-
-impl EventReader {
-    fn new(response: Response) -> Self {
-        Self {
-            response,
-            buffer: String::new(),
         }
     }
 
-    async fn next(&mut self) -> CliResult<Event> {
-        loop {
-            if let Some(event) = take_event(&mut self.buffer)? {
-                return Ok(event);
-            }
-            let chunk = self
-                .response
-                .chunk()
-                .await?
-                .ok_or("runtime event stream closed")?;
-            self.buffer.push_str(std::str::from_utf8(&chunk)?);
-        }
+    stop_child(&mut server);
+    let reason = exit_status.map_or_else(
+        || "nexa-server did not become ready".to_owned(),
+        |status| format!("nexa-server exited with {status} and no local server became ready"),
+    );
+    Err(format!("{reason}; see {}", log_path.display()).into())
+}
+
+fn stop_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
-fn take_event(buffer: &mut String) -> CliResult<Option<Event>> {
-    let Some((boundary, separator_length)) = frame_boundary(buffer) else {
-        return Ok(None);
-    };
-    let frame = buffer[..boundary].to_owned();
-    buffer.drain(..boundary + separator_length);
-    let data = frame
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if data.is_empty() {
-        return Ok(None);
+fn spawn_server(log_path: &Path) -> CliResult<Child> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    Ok(Some(serde_json::from_str(&data)?))
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let errors = log.try_clone()?;
+    let mut command = Command::new(server_binary()?);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(errors));
+    detach(&mut command);
+    command.spawn().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not start nexa-server: {error}"),
+        )
+        .into()
+    })
 }
 
-fn frame_boundary(buffer: &str) -> Option<(usize, usize)> {
-    buffer
-        .find("\n\n")
-        .map(|index| (index, 2))
-        .or_else(|| buffer.find("\r\n\r\n").map(|index| (index, 4)))
+fn server_binary() -> CliResult<PathBuf> {
+    let current_executable = env::current_exe()?;
+    let sibling =
+        current_executable.with_file_name(format!("nexa-server{}", env::consts::EXE_SUFFIX));
+    if sibling.is_file() {
+        Ok(sibling)
+    } else {
+        Ok(PathBuf::from("nexa-server"))
+    }
 }
+
+#[cfg(unix)]
+fn detach(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach(_command: &mut Command) {}
 
 fn prompt_required(label: &str) -> io::Result<String> {
     loop {
@@ -357,6 +286,22 @@ fn credentials_path() -> CliResult<PathBuf> {
     }
 }
 
+fn server_token(local_server: bool) -> CliResult<Option<String>> {
+    match env::var("NEXA_SERVER_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => Ok(Some(token)),
+        Ok(_) => Err("NEXA_SERVER_TOKEN must not be empty".into()),
+        Err(env::VarError::NotPresent) if local_server => {
+            let path = match env::var_os("NEXA_SERVER_TOKEN_FILE") {
+                Some(path) => PathBuf::from(path),
+                None => nexa_home()?.join("server.token"),
+            };
+            Ok(Some(load_or_create_server_token(path)?))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn nexa_home() -> CliResult<PathBuf> {
     env::var_os("NEXA_HOME")
         .map(PathBuf::from)
@@ -364,34 +309,13 @@ fn nexa_home() -> CliResult<PathBuf> {
         .ok_or_else(|| "could not determine the user home directory; set NEXA_HOME".into())
 }
 
-fn endpoint(server_url: &str, path: &str) -> String {
-    format!("{}{path}", server_url.trim_end_matches('/'))
-}
-
 #[cfg(test)]
 mod tests {
-    use nexa_protocol::Event;
-
-    use super::{provider_id, take_event};
+    use super::provider_id;
 
     #[test]
     fn derives_a_stable_provider_id() {
         assert_eq!(provider_id("My DeepSeek API"), "my-deepseek-api");
         assert_eq!(provider_id("  Local / Qwen  "), "local-qwen");
-    }
-
-    #[test]
-    fn decodes_an_event_without_exposing_sse_metadata() {
-        let mut buffer = concat!(
-            "id: 3\n",
-            "event: message\n",
-            "data: {\"type\":\"run_completed\",\"sessionId\":\"local\",",
-            "\"sequence\":3,\"runId\":\"run-1\",\"createdAtMs\":1}\n\n"
-        )
-        .to_owned();
-
-        let event = take_event(&mut buffer).unwrap().unwrap();
-        assert!(matches!(event, Event::RunCompleted { sequence: 3, .. }));
-        assert!(buffer.is_empty());
     }
 }
