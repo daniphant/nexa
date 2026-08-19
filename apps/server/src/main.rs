@@ -8,6 +8,7 @@ use std::{
 
 use nexa_harness::{
     Agent, CredentialFile, HarnessAgent, Provider, ProviderFile, ProviderRegistry, WorkspaceTools,
+    load_or_create_server_token,
 };
 use nexa_runtime::{AgentFactory, SessionRegistry};
 use tokio::net::TcpListener;
@@ -44,6 +45,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let credentials_path = env::var_os("NEXA_CREDENTIALS_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| nexa_home.join("credentials.toml"));
+    let auth_token = match env::var("NEXA_SERVER_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => token,
+        Ok(_) => return Err("NEXA_SERVER_TOKEN must not be empty".into()),
+        Err(env::VarError::NotPresent) => {
+            let token_path = env::var_os("NEXA_SERVER_TOKEN_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| nexa_home.join("server.token"));
+            load_or_create_server_token(token_path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
     let providers = Arc::new(ProviderRegistry::with_credentials(
         ProviderFile::load(&provider_path)?,
         &CredentialFile::load_or_default(credentials_path)?,
@@ -60,6 +72,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Nexa server listening at http://{} with {model_count} available model(s)",
         listener.local_addr()?
     );
-    nexa_server::serve_with_catalog(listener, sessions, catalog).await?;
+    nexa_server::serve_with_catalog(listener, sessions, catalog, auth_token).await?;
     Ok(())
 }

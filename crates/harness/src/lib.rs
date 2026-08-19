@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 pub use config::{
     CredentialFile, CredentialFileError, ProviderConfig, ProviderConfigError, ProviderCredential,
-    ProviderFile,
+    ProviderFile, load_or_create_server_token,
 };
 use nexa_protocol::{ModelMessage, ModelRef, ToolCall, ToolDefinition, ToolResult};
 pub use openai::ProviderRegistry;

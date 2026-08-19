@@ -9,7 +9,9 @@ use std::{
 };
 
 use nexa_client::NexaClient;
-use nexa_harness::{CredentialFile, ProviderConfig, ProviderCredential, ProviderFile};
+use nexa_harness::{
+    CredentialFile, ProviderConfig, ProviderCredential, ProviderFile, load_or_create_server_token,
+};
 use nexa_protocol::ApiFormat;
 
 type CliResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -63,6 +65,8 @@ fn print_help() {
            NEXA_PORT             Default local server port (default: 4123)\n  \
            NEXA_HOME             Nexa state directory (default: ~/.nexa)\n  \
            NEXA_WORKSPACE        Workspace to open (default: current directory)\n  \
+           NEXA_SERVER_TOKEN     Authentication token for an explicit server\n  \
+           NEXA_SERVER_TOKEN_FILE Override the local server token path\n  \
            NEXA_PROVIDER_FILE    Override the provider registry path\n  \
            NEXA_CREDENTIALS_FILE Override the credential store path"
     );
@@ -121,7 +125,10 @@ async fn chat() -> CliResult {
     let server_url = configured_server_url
         .clone()
         .unwrap_or_else(default_server_url);
-    let client = NexaClient::new(server_url, format!("cli-{}", std::process::id()));
+    let mut client = NexaClient::new(server_url, format!("cli-{}", std::process::id()));
+    if let Some(token) = server_token(configured_server_url.is_none())? {
+        client = client.with_token(token);
+    }
     if configured_server_url.is_none() {
         ensure_local_server(&client).await?;
     }
@@ -152,29 +159,37 @@ async fn ensure_local_server(client: &NexaClient) -> CliResult {
     let log_path = nexa_home()?.join("logs/server.log");
     println!("Starting Nexa server…");
     let mut server = spawn_server(&log_path)?;
+    let mut exit_status = None;
 
     for _ in 0..50 {
-        if let Some(status) = server.try_wait()? {
-            return Err(format!(
-                "nexa-server exited with {status}; see {}",
-                log_path.display()
-            )
-            .into());
+        if exit_status.is_none() {
+            exit_status = server.try_wait()?;
         }
         match client.providers().await {
             Ok(_) => return Ok(()),
             Err(error) if error.is_connect() => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                stop_child(&mut server);
+                return Err(error.into());
+            }
         }
     }
 
-    Err(format!(
-        "nexa-server did not become ready; see {}",
-        log_path.display()
-    )
-    .into())
+    stop_child(&mut server);
+    let reason = exit_status.map_or_else(
+        || "nexa-server did not become ready".to_owned(),
+        |status| format!("nexa-server exited with {status} and no local server became ready"),
+    );
+    Err(format!("{reason}; see {}", log_path.display()).into())
+}
+
+fn stop_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn spawn_server(log_path: &Path) -> CliResult<Child> {
@@ -268,6 +283,22 @@ fn credentials_path() -> CliResult<PathBuf> {
     match env::var_os("NEXA_CREDENTIALS_FILE") {
         Some(path) => Ok(PathBuf::from(path)),
         None => Ok(nexa_home()?.join("credentials.toml")),
+    }
+}
+
+fn server_token(local_server: bool) -> CliResult<Option<String>> {
+    match env::var("NEXA_SERVER_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => Ok(Some(token)),
+        Ok(_) => Err("NEXA_SERVER_TOKEN must not be empty".into()),
+        Err(env::VarError::NotPresent) if local_server => {
+            let path = match env::var_os("NEXA_SERVER_TOKEN_FILE") {
+                Some(path) => PathBuf::from(path),
+                None => nexa_home()?.join("server.token"),
+            };
+            Ok(Some(load_or_create_server_token(path)?))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 

@@ -1,9 +1,11 @@
-use std::{error::Error, fmt, str::Utf8Error};
+use std::{error::Error, fmt, str::Utf8Error, sync::Arc, time::Duration};
 
 use nexa_protocol::{
     AcceptedCommand, Command, Event, ModelRef, OpenSessionRequest, ProviderSummary, SessionInfo,
 };
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct NexaClient {
@@ -11,6 +13,7 @@ pub struct NexaClient {
     server_url: String,
     client_id: String,
     session_id: Option<String>,
+    token: Option<Arc<str>>,
 }
 
 impl NexaClient {
@@ -21,7 +24,14 @@ impl NexaClient {
             server_url: server_url.into(),
             client_id: client_id.into(),
             session_id: None,
+            token: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(Arc::from(token.into()));
+        self
     }
 
     #[must_use]
@@ -31,7 +41,11 @@ impl NexaClient {
     }
 
     pub async fn providers(&self) -> Result<Vec<ProviderSummary>, ClientError> {
-        let response = self.http.get(self.endpoint("/providers")).send().await?;
+        let response = self
+            .request(self.http.get(self.endpoint("/providers")))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
         let response = accepted_response(response).await?;
         Ok(response.json().await?)
     }
@@ -41,11 +55,11 @@ impl NexaClient {
         workspace: impl Into<String>,
     ) -> Result<SessionInfo, ClientError> {
         let response = self
-            .http
-            .post(self.endpoint("/sessions/open"))
+            .request(self.http.post(self.endpoint("/sessions/open")))
             .json(&OpenSessionRequest {
                 workspace: workspace.into(),
             })
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await?;
         let response = accepted_response(response).await?;
@@ -55,8 +69,10 @@ impl NexaClient {
     pub async fn subscribe(&self) -> Result<EventStream, ClientError> {
         let session_id = self.session_id()?;
         let response = self
-            .http
-            .get(self.endpoint(&format!("/sessions/{session_id}/events")))
+            .request(
+                self.http
+                    .get(self.endpoint(&format!("/sessions/{session_id}/events"))),
+            )
             .send()
             .await?;
         Ok(EventStream::new(accepted_response(response).await?))
@@ -69,14 +85,14 @@ impl NexaClient {
     ) -> Result<AcceptedCommand, ClientError> {
         let session_id = self.session_id()?.to_owned();
         let response = self
-            .http
-            .post(self.endpoint("/commands"))
+            .request(self.http.post(self.endpoint("/commands")))
             .json(&Command::SendMessage {
                 session_id,
                 client_id: self.client_id.clone(),
                 model,
                 text: text.into(),
             })
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await?;
         let response = accepted_response(response).await?;
@@ -85,6 +101,13 @@ impl NexaClient {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.server_url.trim_end_matches('/'))
+    }
+
+    fn request(&self, request: RequestBuilder) -> RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token.as_ref()),
+            None => request,
+        }
     }
 
     fn session_id(&self) -> Result<&str, ClientError> {
@@ -109,8 +132,10 @@ impl EventStream {
 
     pub async fn next(&mut self) -> Result<Event, ClientError> {
         loop {
-            if let Some(event) = take_event(&mut self.buffer)? {
-                return Ok(event);
+            match take_event(&mut self.buffer)? {
+                FrameRead::Event(event) => return Ok(event),
+                FrameRead::Skipped => continue,
+                FrameRead::Incomplete => {}
             }
             let chunk = self
                 .response
@@ -120,6 +145,13 @@ impl EventStream {
             self.buffer.extend_from_slice(&chunk);
         }
     }
+}
+
+#[derive(Debug)]
+enum FrameRead {
+    Incomplete,
+    Skipped,
+    Event(Event),
 }
 
 async fn accepted_response(response: Response) -> Result<Response, ClientError> {
@@ -134,9 +166,9 @@ async fn accepted_response(response: Response) -> Result<Response, ClientError> 
     Err(ClientError::Rejected { status, body })
 }
 
-fn take_event(buffer: &mut Vec<u8>) -> Result<Option<Event>, ClientError> {
+fn take_event(buffer: &mut Vec<u8>) -> Result<FrameRead, ClientError> {
     let Some((boundary, separator_length)) = frame_boundary(buffer) else {
-        return Ok(None);
+        return Ok(FrameRead::Incomplete);
     };
     let frame = buffer.drain(..boundary).collect::<Vec<_>>();
     buffer.drain(..separator_length);
@@ -147,9 +179,9 @@ fn take_event(buffer: &mut Vec<u8>) -> Result<Option<Event>, ClientError> {
         .collect::<Vec<_>>()
         .join("\n");
     if data.is_empty() {
-        return Ok(None);
+        return Ok(FrameRead::Skipped);
     }
-    Ok(Some(serde_json::from_str(&data)?))
+    Ok(FrameRead::Event(serde_json::from_str(&data)?))
 }
 
 fn frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -230,7 +262,7 @@ impl From<Utf8Error> for ClientError {
 mod tests {
     use nexa_protocol::Event;
 
-    use super::take_event;
+    use super::{FrameRead, take_event};
 
     #[test]
     fn decodes_an_event_without_exposing_sse_metadata() {
@@ -243,7 +275,9 @@ mod tests {
         .as_bytes()
         .to_vec();
 
-        let event = take_event(&mut buffer).unwrap().unwrap();
+        let FrameRead::Event(event) = take_event(&mut buffer).unwrap() else {
+            panic!("expected a complete event");
+        };
         assert!(matches!(event, Event::RunCompleted { sequence: 3, .. }));
         assert!(buffer.is_empty());
     }
@@ -251,7 +285,10 @@ mod tests {
     #[test]
     fn waits_for_a_complete_frame() {
         let mut buffer = b"data: {\"type\":\"run_completed\"}".to_vec();
-        assert!(take_event(&mut buffer).unwrap().is_none());
+        assert!(matches!(
+            take_event(&mut buffer).unwrap(),
+            FrameRead::Incomplete
+        ));
         assert!(!buffer.is_empty());
     }
 
@@ -265,13 +302,39 @@ mod tests {
         let split = frame.iter().position(|byte| *byte == 0xc3).unwrap() + 1;
         let mut buffer = frame[..split].to_vec();
 
-        assert!(take_event(&mut buffer).unwrap().is_none());
+        assert!(matches!(
+            take_event(&mut buffer).unwrap(),
+            FrameRead::Incomplete
+        ));
         buffer.extend_from_slice(&frame[split..]);
-        let event = take_event(&mut buffer).unwrap().unwrap();
+        let FrameRead::Event(event) = take_event(&mut buffer).unwrap() else {
+            panic!("expected a complete event");
+        };
 
         assert!(matches!(
             event,
             Event::AssistantTextDelta { text, .. } if text == "olá"
         ));
+    }
+
+    #[test]
+    fn skips_a_keep_alive_without_waiting_for_another_chunk() {
+        let mut buffer = concat!(
+            ": keep-alive\n\n",
+            "data: {\"type\":\"run_completed\",\"sessionId\":\"local\",",
+            "\"sequence\":3,\"runId\":\"run-1\",\"createdAtMs\":1}\n\n"
+        )
+        .as_bytes()
+        .to_vec();
+
+        assert!(matches!(
+            take_event(&mut buffer).unwrap(),
+            FrameRead::Skipped
+        ));
+        let FrameRead::Event(event) = take_event(&mut buffer).unwrap() else {
+            panic!("expected the buffered event after the keep-alive");
+        };
+        assert!(matches!(event, Event::RunCompleted { sequence: 3, .. }));
+        assert!(buffer.is_empty());
     }
 }

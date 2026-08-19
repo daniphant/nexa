@@ -14,6 +14,7 @@ use tempfile::tempdir;
 use tokio::{net::TcpListener, task::JoinHandle};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+const TEST_TOKEN: &str = "test-local-server-token";
 
 #[tokio::test]
 async fn two_clients_share_one_ordered_replayable_session() -> TestResult {
@@ -174,13 +175,14 @@ async fn exposes_the_runtime_provider_catalog() -> TestResult {
         models: vec!["deepseek-chat".to_owned()],
     }];
     let server = tokio::spawn(async move {
-        nexa_server::serve_with_catalog(listener, registry, catalog)
+        nexa_server::serve_with_catalog(listener, registry, catalog, TEST_TOKEN.to_owned())
             .await
             .expect("test server should remain available");
     });
 
     let providers = Client::new()
         .get(format!("{base_url}/providers"))
+        .bearer_auth(TEST_TOKEN)
         .send()
         .await?
         .error_for_status()?
@@ -190,6 +192,52 @@ async fn exposes_the_runtime_provider_catalog() -> TestResult {
     assert_eq!(providers[0].id, "deepseek");
     assert_eq!(providers[0].models, ["deepseek-chat"]);
 
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_workspace_access_without_the_local_server_token() -> TestResult {
+    let state = tempdir()?;
+    let workspace = tempdir()?;
+    let registry = SessionRegistry::without_agent(state.path());
+    let (base_url, server) = start_server(registry).await?;
+
+    let response = Client::new()
+        .post(format!("{base_url}/sessions/open"))
+        .json(&OpenSessionRequest {
+            workspace: workspace.path().to_string_lossy().into_owned(),
+        })
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(state.path().read_dir()?.next().is_none());
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_corrupt_session_metadata_as_a_server_error() -> TestResult {
+    let state = tempdir()?;
+    let workspace = tempdir()?;
+    let info = SessionRegistry::without_agent(state.path())
+        .open_workspace(workspace.path())
+        .await?;
+    tokio::fs::write(
+        state.path().join(&info.id).join("session.json"),
+        b"not json",
+    )
+    .await?;
+    let (base_url, server) = start_server(SessionRegistry::without_agent(state.path())).await?;
+
+    let response = Client::new()
+        .get(format!("{base_url}/sessions/{}/events", info.id))
+        .bearer_auth(TEST_TOKEN)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     server.abort();
     Ok(())
 }
@@ -287,7 +335,7 @@ async fn start_server(registry: SessionRegistry) -> TestResult<(String, JoinHand
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let base_url = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
-        nexa_server::serve(listener, registry)
+        nexa_server::serve(listener, registry, TEST_TOKEN.to_owned())
             .await
             .expect("test server should remain available");
     });
@@ -301,6 +349,7 @@ async fn open_session(
 ) -> TestResult<SessionInfo> {
     Ok(client
         .post(format!("{base_url}/sessions/open"))
+        .bearer_auth(TEST_TOKEN)
         .json(&OpenSessionRequest {
             workspace: workspace
                 .to_str()
@@ -323,6 +372,7 @@ async fn send_message(
 ) -> TestResult<StatusCode> {
     let response = client
         .post(format!("{base_url}/commands"))
+        .bearer_auth(TEST_TOKEN)
         .json(&Command::SendMessage {
             session_id: session_id.to_owned(),
             client_id: client_id.to_owned(),
@@ -369,6 +419,7 @@ impl EventClient {
     async fn connect(client: &Client, base_url: &str, session_id: &str) -> TestResult<Self> {
         let response = client
             .get(format!("{base_url}/sessions/{session_id}/events"))
+            .bearer_auth(TEST_TOKEN)
             .timeout(Duration::from_secs(2))
             .send()
             .await?

@@ -33,12 +33,14 @@ Nexa keeps user-level state under `~/.nexa` by default:
 
 - `provider.toml` contains provider names, endpoints, API formats, and models.
 - `credentials.toml` contains API keys and is written with `0600` permissions on Unix.
+- `server.token` authenticates clients to the local server and is written with
+  `0600` permissions on Unix.
 - `sessions/<session-id>/session.json` stores the immutable workspace binding.
 - `sessions/<session-id>/events.ndjson` is that session's durable event stream.
 
 Set `NEXA_HOME` to move the complete state directory. The more specific
-`NEXA_PROVIDER_FILE`, `NEXA_CREDENTIALS_FILE`, and `NEXA_SESSIONS_DIR` overrides are
-useful for isolated development and tests.
+`NEXA_PROVIDER_FILE`, `NEXA_CREDENTIALS_FILE`, `NEXA_SERVER_TOKEN_FILE`, and
+`NEXA_SESSIONS_DIR` overrides are useful for isolated development and tests.
 
 ## Provider registry
 
@@ -84,9 +86,11 @@ directory as a tool root.
 
 ## Install from this checkout
 
-Install or update both release binaries in Cargo's executable directory:
+Install the pinned toolchain, then install or update both release binaries in
+Cargo's executable directory:
 
 ```sh
+mise install
 cargo install --locked --force --path apps/server
 cargo install --locked --force --path apps/cli
 ```
@@ -96,12 +100,6 @@ available from every directory. Re-run the commands after making local changes
 that you want reflected in the installed binaries.
 
 ## Run the active session
-
-Install the exact Rust toolchain pinned for the project:
-
-```sh
-mise install
-```
 
 Configure a provider:
 
@@ -118,28 +116,35 @@ cargo run -p nexa-cli
 Running `nexa` opens a fullscreen terminal UI for the current workspace's
 default session. It replays the durable transcript, streams assistant text,
 shows compact tool activity, and asks you to choose when more than one
-provider/model pair is available. When the default local server is not running, the CLI starts
-`nexa-server` as a detached background process and waits for it to become ready.
-Server output is appended to `~/.nexa/logs/server.log`.
+provider/model pair is available. When the default local server is not running,
+the CLI starts `nexa-server` as a detached background process and waits for it
+to become ready. Server output is appended to `$NEXA_HOME/logs/server.log`,
+which defaults to `~/.nexa/logs/server.log`.
 
 An explicit `NEXA_SERVER_URL` remains externally managed and is never replaced
-by an automatically started local server.
+by an automatically started local server. Set `NEXA_SERVER_TOKEN` when that
+server requires bearer authentication.
 
 The terminal UI uses these controls:
 
 - `Enter` sends the current one-line message.
-- `Ctrl+M` opens the provider/model picker.
+- `F2` opens the provider/model picker.
 - `Page Up`, `Page Down`, arrow keys, or the mouse wheel scroll the transcript.
 - `Ctrl+U` clears the composer.
 - `Ctrl+C`, `/quit`, or `/exit` leaves Nexa.
 
-The HTTP protocol remains available to every future client. First open the
-default session for a workspace:
+The HTTP protocol remains available to every future client. Local clients read
+the owner-only server token and send it as a bearer token. To open the default
+session for a workspace manually:
 
 ```sh
+token_file="${NEXA_SERVER_TOKEN_FILE:-${NEXA_HOME:-$HOME/.nexa}/server.token}"
+read -r nexa_server_token < "$token_file"
 curl -X POST http://127.0.0.1:4123/sessions/open \
+  -H "authorization: Bearer $nexa_server_token" \
   -H 'content-type: application/json' \
   -d '{"workspace":"/absolute/path/to/workspace"}'
+unset nexa_server_token token_file
 ```
 
 The response contains a stable session ID. Its replayable event stream is
@@ -148,7 +153,8 @@ include that `sessionId`.
 
 On first use after upgrading from the original singleton runtime, Nexa assigns
 the legacy `sessions/local.ndjson` history to the first workspace opened and
-keeps the original as `sessions/local.ndjson.migrated`.
+keeps the original as `sessions/local.ndjson.migrated`. A malformed legacy log
+is moved to `sessions/local.ndjson.corrupt` instead of blocking every workspace.
 
 The harness currently exposes exactly two workspace-scoped tools:
 

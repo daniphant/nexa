@@ -161,7 +161,7 @@ impl SessionRegistry {
                 self.migrate_legacy_log(&event_log_path, &info.id).await?;
                 let metadata = serde_json::to_vec_pretty(&info)
                     .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
-                fs::write(&metadata_path, metadata).await?;
+                atomic_write(&metadata_path, metadata).await?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(RegistryError::NotFound(info.id));
@@ -200,27 +200,43 @@ impl SessionRegistry {
         };
         let mut migrated = Vec::new();
         for (index, line) in contents.lines().enumerate() {
-            let mut event: Event = serde_json::from_str(line).map_err(|error| {
-                RegistryError::InvalidMetadata(format!(
-                    "invalid legacy event log line {}: {error}",
-                    index + 1
-                ))
-            })?;
+            let Ok(mut event) = serde_json::from_str::<Event>(line) else {
+                self.quarantine_legacy_log(&legacy_path).await?;
+                return Ok(());
+            };
             let expected = u64::try_from(index).unwrap_or(u64::MAX) + 1;
             if event.session_id() != "local" || event.sequence() != expected {
-                return Err(RegistryError::InvalidMetadata(format!(
-                    "invalid legacy event sequence on line {}",
-                    index + 1
-                )));
+                self.quarantine_legacy_log(&legacy_path).await?;
+                return Ok(());
             }
             replace_event_session_id(&mut event, session_id);
             serde_json::to_writer(&mut migrated, &event)
                 .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
             migrated.push(b'\n');
         }
-        fs::write(event_log_path, migrated).await?;
-        fs::rename(legacy_path, migrated_path).await?;
+        fs::rename(&legacy_path, migrated_path).await?;
+        atomic_write(event_log_path, migrated).await?;
         Ok(())
+    }
+
+    async fn quarantine_legacy_log(&self, legacy_path: &Path) -> Result<(), RegistryError> {
+        for suffix in 0_u32..=u32::MAX {
+            let file_name = if suffix == 0 {
+                "local.ndjson.corrupt".to_owned()
+            } else {
+                format!("local.ndjson.corrupt.{suffix}")
+            };
+            let candidate = self.sessions_directory.join(file_name);
+            if !fs::try_exists(&candidate).await? {
+                fs::rename(legacy_path, candidate).await?;
+                return Ok(());
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no legacy log quarantine path is available",
+        )
+        .into())
     }
 
     fn session_directory(&self, session_id: &str) -> PathBuf {
@@ -611,7 +627,18 @@ async fn load_events(event_log_path: &Path, session_id: &str) -> Result<Vec<Even
                 )
             })?;
             let expected_sequence = u64::try_from(index).unwrap_or(u64::MAX) + 1;
-            if event.session_id() != session_id || event.sequence() != expected_sequence {
+            if event.session_id() != session_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "event log line {} belongs to session {:?}, not {session_id:?}",
+                        index + 1,
+                        event.session_id()
+                    ),
+                )
+                .into());
+            }
+            if event.sequence() != expected_sequence {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("invalid event log sequence on line {}", index + 1),
@@ -621,6 +648,24 @@ async fn load_events(event_log_path: &Path, session_id: &str) -> Result<Vec<Even
             Ok(event)
         })
         .collect()
+}
+
+async fn atomic_write(path: &Path, contents: Vec<u8>) -> io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("file has no parent directory"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&contents)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 async fn persist_event(event_log: &mut File, event: &Event) -> Result<(), SessionError> {
@@ -674,10 +719,7 @@ impl RegistryError {
     pub fn is_invalid_request(&self) -> bool {
         matches!(
             self,
-            Self::Workspace(_)
-                | Self::InvalidWorkspace(_)
-                | Self::InvalidSessionId(_)
-                | Self::InvalidMetadata(_)
+            Self::Workspace(_) | Self::InvalidWorkspace(_) | Self::InvalidSessionId(_)
         )
     }
 }
@@ -754,7 +796,7 @@ mod tests {
     use nexa_protocol::{Event, ModelRef, SessionInfo};
     use tempfile::tempdir;
 
-    use super::SessionRegistry;
+    use super::{RegistryError, SessionRegistry};
 
     #[tokio::test]
     async fn migrates_the_legacy_local_log_into_the_first_workspace() {
@@ -810,5 +852,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_session_id_that_could_escape_the_sessions_directory() {
+        let state = tempdir().unwrap();
+        let registry = SessionRegistry::without_agent(state.path());
+
+        assert!(matches!(
+            registry.session("../../etc").await,
+            Err(RegistryError::InvalidSessionId(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn quarantines_a_corrupt_legacy_log_without_blocking_the_workspace() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        tokio::fs::write(state.path().join("local.ndjson"), b"not json\n")
+            .await
+            .unwrap();
+
+        let registry = SessionRegistry::without_agent(state.path());
+        let info = registry.open_workspace(workspace.path()).await.unwrap();
+        assert!(registry.session(&info.id).await.is_ok());
+        assert!(!state.path().join("local.ndjson").exists());
+        assert!(state.path().join("local.ndjson.corrupt").exists());
     }
 }

@@ -19,6 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use tokio::sync::mpsc;
 
 pub async fn run(client: NexaClient) -> Result<(), TuiError> {
     let providers = client.providers().await?;
@@ -29,6 +30,7 @@ pub async fn run(client: NexaClient) -> Result<(), TuiError> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     let mut terminal_events = EventStream::new();
+    let (submission_results, mut submissions) = mpsc::unbounded_channel();
 
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
@@ -36,7 +38,7 @@ pub async fn run(client: NexaClient) -> Result<(), TuiError> {
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(event)) => {
-                        if handle_terminal_event(event, &client, &mut app).await? {
+                        if handle_terminal_event(event, &client, &submission_results, &mut app) {
                             break;
                         }
                     }
@@ -45,22 +47,28 @@ pub async fn run(client: NexaClient) -> Result<(), TuiError> {
                 }
             }
             event = events.next() => app.apply(event?),
+            submission = submissions.recv() => {
+                if let Some(submission) = submission {
+                    app.finish_submission(submission);
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-async fn handle_terminal_event(
+fn handle_terminal_event(
     event: TerminalEvent,
     client: &NexaClient,
+    submissions: &mpsc::UnboundedSender<Submission>,
     app: &mut App,
-) -> Result<bool, TuiError> {
+) -> bool {
     match event {
         TerminalEvent::Key(key)
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
         {
-            handle_key(key, client, app).await
+            handle_key(key, client, submissions, app)
         }
         TerminalEvent::Mouse(mouse) => {
             match mouse.kind {
@@ -68,19 +76,24 @@ async fn handle_terminal_event(
                 MouseEventKind::ScrollDown => app.scroll_down(3),
                 _ => {}
             }
-            Ok(false)
+            false
         }
         TerminalEvent::Resize(_, _)
         | TerminalEvent::FocusGained
         | TerminalEvent::FocusLost
-        | TerminalEvent::Paste(_) => Ok(false),
-        TerminalEvent::Key(_) => Ok(false),
+        | TerminalEvent::Paste(_) => false,
+        TerminalEvent::Key(_) => false,
     }
 }
 
-async fn handle_key(key: KeyEvent, client: &NexaClient, app: &mut App) -> Result<bool, TuiError> {
+fn handle_key(
+    key: KeyEvent,
+    client: &NexaClient,
+    submissions: &mpsc::UnboundedSender<Submission>,
+    app: &mut App,
+) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Ok(true);
+        return true;
     }
 
     if app.picker_open {
@@ -91,31 +104,31 @@ async fn handle_key(key: KeyEvent, client: &NexaClient, app: &mut App) -> Result
             KeyCode::Esc => app.picker_open = false,
             _ => {}
         }
-        return Ok(false);
+        return false;
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('m') {
+    if key.code == KeyCode::F(2) {
         app.open_model_picker();
-        return Ok(false);
+        return false;
     }
 
     match key.code {
         KeyCode::Enter => {
             if app.input_text().trim() == "/quit" || app.input_text().trim() == "/exit" {
-                return Ok(true);
+                return true;
             }
-            if let Some(message) = app.message_to_send() {
-                app.submitting = true;
-                let result = client.send_message(app.model().clone(), message).await;
-                app.submitting = false;
-                match result {
-                    Ok(_) => {
-                        app.clear_input();
-                        app.notice = None;
-                        app.follow_tail = true;
-                    }
-                    Err(error) => app.notice = Some(error.to_string()),
-                }
+            if let Some((model, message)) = app.begin_submission() {
+                let client = client.clone();
+                let submissions = submissions.clone();
+                let task = tokio::spawn(async move {
+                    let result = client
+                        .send_message(model, message.clone())
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                    let _ = submissions.send(Submission { message, result });
+                });
+                drop(task);
             }
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.clear_input(),
@@ -136,7 +149,12 @@ async fn handle_key(key: KeyEvent, client: &NexaClient, app: &mut App) -> Result
         KeyCode::Down => app.scroll_down(1),
         _ => {}
     }
-    Ok(false)
+    false
+}
+
+struct Submission {
+    message: String,
+    result: Result<(), String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,6 +289,29 @@ impl App {
         }
         let message = self.input_text();
         (!message.trim().is_empty()).then_some(message)
+    }
+
+    fn begin_submission(&mut self) -> Option<(ModelRef, String)> {
+        let message = self.message_to_send()?;
+        let model = self.model();
+        self.submitting = true;
+        self.notice = None;
+        self.clear_input();
+        Some((model, message))
+    }
+
+    fn finish_submission(&mut self, submission: Submission) {
+        self.submitting = false;
+        match submission.result {
+            Ok(()) => self.follow_tail = true,
+            Err(error) => {
+                if self.input.is_empty() {
+                    self.input = submission.message.chars().collect();
+                    self.cursor = self.input.len();
+                }
+                self.notice = Some(error);
+            }
+        }
     }
 
     fn clear_input(&mut self) {
@@ -559,7 +600,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let text = app
         .notice
         .as_deref()
-        .unwrap_or(" Enter send  ·  Ctrl+M models  ·  PgUp/PgDn scroll  ·  Ctrl+C quit ");
+        .unwrap_or(" Enter send  ·  F2 models  ·  PgUp/PgDn scroll  ·  Ctrl+C quit ");
     let style = if app.notice.is_some() {
         Style::default().fg(Color::Red)
     } else {
@@ -701,7 +742,7 @@ mod tests {
     use nexa_protocol::{ApiFormat, Event, ProviderSummary, ToolCall, ToolResult};
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{App, RunState, ToolState, TranscriptItem, render};
+    use super::{App, RunState, Submission, ToolState, TranscriptItem, render};
 
     fn app() -> App {
         App::new(vec![ProviderSummary {
@@ -828,6 +869,26 @@ mod tests {
             app.transcript.last(),
             Some(TranscriptItem::Error(error)) if error == "connection lost"
         ));
+    }
+
+    #[test]
+    fn submission_state_is_visible_and_a_failed_message_can_be_retried() {
+        let mut app = app();
+        for character in "hello".chars() {
+            app.insert(character);
+        }
+
+        let (_, message) = app.begin_submission().unwrap();
+        assert!(app.submitting);
+        assert!(app.input.is_empty());
+
+        app.finish_submission(Submission {
+            message,
+            result: Err("server unavailable".to_owned()),
+        });
+        assert!(!app.submitting);
+        assert_eq!(app.input_text(), "hello");
+        assert_eq!(app.notice.as_deref(), Some("server unavailable"));
     }
 
     #[test]
