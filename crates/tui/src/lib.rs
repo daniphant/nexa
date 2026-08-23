@@ -1,4 +1,8 @@
-use std::{error::Error, fmt, io};
+use std::{
+    error::Error,
+    fmt, io,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crossterm::{
     event::{
@@ -9,8 +13,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
-use nexa_client::{ClientError, NexaClient};
-use nexa_protocol::{Event, ModelRef, ProviderSummary};
+use nexa_client::{ClientError, EventStream as SseStream, NexaClient};
+use nexa_protocol::{Event, ModelRef, ProviderSummary, ReasoningEffort, SessionSummary};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -21,10 +25,39 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-pub async fn run(client: NexaClient) -> Result<(), TuiError> {
+/// Async work inside the TUI reports back through this channel so the main
+/// loop can swap its event stream or open overlays.
+pub enum Control {
+    /// A freshly subscribed event stream, tagged with its session.
+    StreamReady {
+        session_id: String,
+        stream: SseStream,
+    },
+    /// The client detached from its session (`/new` before any message).
+    Detached,
+    /// The listing requested by `/sessions`.
+    Sessions(Vec<SessionSummary>),
+    /// Background work failed; shown as a notice.
+    Failed(String),
+}
+
+pub async fn run(
+    client: NexaClient,
+    workspace: String,
+    preferred_model: Option<ModelRef>,
+    preferred_effort: Option<ReasoningEffort>,
+) -> Result<(ModelRef, Option<ReasoningEffort>), TuiError> {
     let providers = client.providers().await?;
-    let mut app = App::new(providers)?;
-    let mut events = client.subscribe().await?;
+    let mut app = App::new(providers, preferred_model, preferred_effort)?;
+    // Lazy sessions: nothing is created until the first message is sent, so
+    // there is no stream to subscribe to at startup.
+    let mut events: Option<SseStream> = if client.has_session() {
+        Some(client.subscribe().await?)
+    } else {
+        None
+    };
+    let (controls, mut control_events) = mpsc::unbounded_channel::<Control>();
+    let mut client = client;
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -38,7 +71,14 @@ pub async fn run(client: NexaClient) -> Result<(), TuiError> {
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(event)) => {
-                        if handle_terminal_event(event, &client, &submission_results, &mut app) {
+                        if handle_terminal_event(
+                            event,
+                            &mut client,
+                            &workspace,
+                            &controls,
+                            &submission_results,
+                            &mut app,
+                        ) {
                             break;
                         }
                     }
@@ -46,21 +86,42 @@ pub async fn run(client: NexaClient) -> Result<(), TuiError> {
                     None => return Err(TuiError::TerminalEventsClosed),
                 }
             }
-            event = events.next() => app.apply(event?),
+            event = async { events.as_mut().expect("stream present").next().await }, if events.is_some() => {
+                app.apply(event?);
+            }
             submission = submissions.recv() => {
                 if let Some(submission) = submission {
                     app.finish_submission(submission);
                 }
             }
+            control = control_events.recv() => {
+                match control {
+                    Some(Control::StreamReady { session_id, stream }) => {
+                        client.select_session(&session_id);
+                        events = Some(stream);
+                        app.reset_for_session_switch();
+                    }
+                    Some(Control::Detached) => {
+                        client.clear_session();
+                        events = None;
+                        app.reset_for_session_switch();
+                    }
+                    Some(Control::Sessions(sessions)) => app.open_sessions_overlay(sessions),
+                    Some(Control::Failed(error)) => app.notice = Some(error),
+                    None => {}
+                }
+            }
         }
     }
 
-    Ok(())
+    Ok((app.model(), app.effort))
 }
 
 fn handle_terminal_event(
     event: TerminalEvent,
-    client: &NexaClient,
+    client: &mut NexaClient,
+    workspace: &str,
+    controls: &mpsc::UnboundedSender<Control>,
     submissions: &mpsc::UnboundedSender<Submission>,
     app: &mut App,
 ) -> bool {
@@ -68,7 +129,7 @@ fn handle_terminal_event(
         TerminalEvent::Key(key)
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
         {
-            handle_key(key, client, submissions, app)
+            handle_key(key, client, workspace, controls, submissions, app)
         }
         TerminalEvent::Mouse(mouse) => {
             match mouse.kind {
@@ -88,12 +149,29 @@ fn handle_terminal_event(
 
 fn handle_key(
     key: KeyEvent,
-    client: &NexaClient,
+    client: &mut NexaClient,
+    workspace: &str,
+    controls: &mpsc::UnboundedSender<Control>,
     submissions: &mpsc::UnboundedSender<Submission>,
     app: &mut App,
 ) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
+    }
+
+    if app.sessions_open {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => app.previous_session(),
+            KeyCode::Down | KeyCode::Char('j') => app.next_session(),
+            KeyCode::Enter => {
+                if let Some(summary) = app.choose_session() {
+                    switch_to_session(client, controls, &summary);
+                }
+            }
+            KeyCode::Esc => app.sessions_open = false,
+            _ => {}
+        }
+        return false;
     }
 
     if app.picker_open {
@@ -114,15 +192,46 @@ fn handle_key(
 
     match key.code {
         KeyCode::Enter => {
-            if app.input_text().trim() == "/quit" || app.input_text().trim() == "/exit" {
-                return true;
+            let input = app.input_text();
+            let trimmed_input = input.trim();
+            if trimmed_input.starts_with('/') {
+                if execute_command(trimmed_input, client, workspace, controls, app) {
+                    return true;
+                }
+                return false;
             }
             if let Some((model, message)) = app.begin_submission() {
-                let client = client.clone();
+                let effort = app.effort;
+                let preset = None; // the TUI does not use agent presets yet
+                let mut task_client = client.clone();
+                let workspace_owned = workspace.to_owned();
                 let submissions = submissions.clone();
+                let controls = controls.clone();
                 let task = tokio::spawn(async move {
-                    let result = client
-                        .send_message(model, message.clone())
+                    // Lazy sessions: the first message materializes one.
+                    if !task_client.has_session() {
+                        match task_client.create_session(&workspace_owned).await {
+                            Ok(info) => {
+                                task_client.select_session(&info.id);
+                                match task_client.subscribe().await {
+                                    Ok(stream) => {
+                                        let _ = controls.send(Control::StreamReady {
+                                            session_id: info.id,
+                                            stream,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = controls.send(Control::Failed(error.to_string()));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = controls.send(Control::Failed(error.to_string()));
+                            }
+                        }
+                    }
+                    let result = task_client
+                        .send_message(model, preset, effort, message.clone())
                         .await
                         .map(|_| ())
                         .map_err(|error| error.to_string());
@@ -157,11 +266,96 @@ struct Submission {
     result: Result<(), String>,
 }
 
+/// `/sessions` — fetches the workspace's sessions and opens the overlay.
+fn list_sessions(client: &NexaClient, workspace: &str, controls: &mpsc::UnboundedSender<Control>) {
+    let client = client.clone();
+    let workspace = workspace.to_owned();
+    let controls = controls.clone();
+    let task = tokio::spawn(async move {
+        match client.list_sessions(workspace).await {
+            Ok(sessions) => {
+                let _ = controls.send(Control::Sessions(sessions));
+            }
+            Err(error) => {
+                let _ = controls.send(Control::Failed(error.to_string()));
+            }
+        }
+    });
+    drop(task);
+}
+
+/// Dispatches a `/command` line. Returns `true` when the TUI should exit.
+fn execute_command(
+    raw: &str,
+    client: &mut NexaClient,
+    workspace: &str,
+    controls: &mpsc::UnboundedSender<Control>,
+    app: &mut App,
+) -> bool {
+    let mut parts = raw[1..].split_whitespace();
+    match parts
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "new" => {
+            start_new_session(client, workspace, controls);
+            app.notice = Some("Creating a new chat…".to_owned());
+            app.clear_input();
+            false
+        }
+        "sessions" => {
+            list_sessions(client, workspace, controls);
+            app.clear_input();
+            false
+        }
+        _ => app.execute_command(raw),
+    }
+}
+
+/// `/new` — detaches from the current chat. A replacement conversation only
+/// materializes when its first message is sent, so abandoned fresh starts
+/// never touch disk.
+fn start_new_session(
+    client: &mut NexaClient,
+    workspace: &str,
+    controls: &mpsc::UnboundedSender<Control>,
+) {
+    let _ = workspace;
+    client.clear_session();
+    let _ = controls.send(Control::Detached);
+}
+
+/// `/sessions` overlay Enter — subscribes to the chosen session.
+fn switch_to_session(
+    client: &mut NexaClient,
+    controls: &mpsc::UnboundedSender<Control>,
+    summary: &SessionSummary,
+) {
+    client.select_session(&summary.id);
+    let session_id = summary.id.clone();
+    let switched = client.clone();
+    let controls = controls.clone();
+    let task = tokio::spawn(async move {
+        match switched.subscribe().await {
+            Ok(stream) => {
+                let _ = controls.send(Control::StreamReady { session_id, stream });
+            }
+            Err(error) => {
+                let _ = controls.send(Control::Failed(error.to_string()));
+            }
+        }
+    });
+    drop(task);
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelChoice {
     provider_id: String,
     provider_name: String,
     model: String,
+    reasoning_efforts: Option<Vec<ReasoningEffort>>,
 }
 
 impl ModelChoice {
@@ -208,6 +402,10 @@ struct App {
     selected_model: usize,
     picker_model: usize,
     picker_open: bool,
+    effort: Option<ReasoningEffort>,
+    sessions: Option<Vec<SessionSummary>>,
+    sessions_cursor: usize,
+    sessions_open: bool,
     transcript: Vec<TranscriptItem>,
     input: Vec<char>,
     cursor: usize,
@@ -219,26 +417,43 @@ struct App {
 }
 
 impl App {
-    fn new(providers: Vec<ProviderSummary>) -> Result<Self, TuiError> {
+    fn new(
+        providers: Vec<ProviderSummary>,
+        preferred_model: Option<ModelRef>,
+        preferred_effort: Option<ReasoningEffort>,
+    ) -> Result<Self, TuiError> {
         let choices = providers
             .into_iter()
             .flat_map(|provider| {
                 provider.models.into_iter().map(move |model| ModelChoice {
                     provider_id: provider.id.clone(),
                     provider_name: provider.name.clone(),
-                    model,
+                    model: model.id,
+                    reasoning_efforts: model.reasoning_efforts,
                 })
             })
             .collect::<Vec<_>>();
         if choices.is_empty() {
             return Err(TuiError::NoModels);
         }
-        let picker_open = choices.len() > 1;
+        // A previously persisted default that still exists is selected
+        // silently; anything else falls back to asking when there is a
+        // choice to make.
+        let selected_model = preferred_model.and_then(|preferred| {
+            choices.iter().position(|choice| {
+                choice.provider_id == preferred.provider && choice.model == preferred.id
+            })
+        });
+        let picker_open = selected_model.is_none() && choices.len() > 1;
         Ok(Self {
             choices,
-            selected_model: 0,
+            selected_model: selected_model.unwrap_or(0),
             picker_model: 0,
             picker_open,
+            effort: preferred_effort,
+            sessions: None,
+            sessions_cursor: 0,
+            sessions_open: false,
             transcript: Vec::new(),
             input: Vec::new(),
             cursor: 0,
@@ -277,6 +492,82 @@ impl App {
     fn choose_model(&mut self) {
         self.selected_model = self.picker_model;
         self.picker_open = false;
+        self.drop_unsupported_effort();
+    }
+
+    fn open_sessions_overlay(&mut self, sessions: Vec<SessionSummary>) {
+        if sessions.is_empty() {
+            self.notice = Some("No saved sessions for this workspace yet.".to_owned());
+            return;
+        }
+        self.sessions_cursor = 0;
+        self.sessions = Some(sessions);
+        self.sessions_open = true;
+    }
+
+    fn previous_session(&mut self) {
+        let Some(sessions) = &self.sessions else {
+            return;
+        };
+        self.sessions_cursor = self
+            .sessions_cursor
+            .checked_sub(1)
+            .unwrap_or(sessions.len() - 1);
+    }
+
+    fn next_session(&mut self) {
+        let Some(sessions) = &self.sessions else {
+            return;
+        };
+        self.sessions_cursor = (self.sessions_cursor + 1) % sessions.len();
+    }
+
+    fn choose_session(&mut self) -> Option<SessionSummary> {
+        let summary = self
+            .sessions
+            .as_ref()
+            .and_then(|sessions| sessions.get(self.sessions_cursor))
+            .cloned();
+        self.sessions_open = false;
+        summary
+    }
+
+    /// Drops presentation state so the freshly subscribed stream can replay
+    /// another session's transcript into a clean slate.
+    fn reset_for_session_switch(&mut self) {
+        self.transcript.clear();
+        self.scroll = 0;
+        self.follow_tail = true;
+        self.submitting = false;
+        self.run_state = RunState::Idle;
+        self.notice = None;
+    }
+
+    /// The efforts selectable for the active model.
+    ///
+    /// A declared list is used as-is. When the provider did not say, the
+    /// widely-supported [`ReasoningEffort::COMMON`] set is offered instead of
+    /// every wire value.
+    fn offered_efforts(&self) -> &[ReasoningEffort] {
+        match self.model_choice().reasoning_efforts.as_deref() {
+            Some(efforts) => efforts,
+            None => nexa_harness::inferred_reasoning_efforts(&self.model_choice().model)
+                .unwrap_or(&ReasoningEffort::COMMON),
+        }
+    }
+
+    fn supports_effort(&self, effort: ReasoningEffort) -> bool {
+        self.offered_efforts().contains(&effort)
+    }
+
+    /// Drops the current effort when a freshly selected model does not
+    /// report supporting it.
+    fn drop_unsupported_effort(&mut self) {
+        if let Some(effort) = self.effort
+            && !self.supports_effort(effort)
+        {
+            self.effort = None;
+        }
     }
 
     fn input_text(&self) -> String {
@@ -317,6 +608,127 @@ impl App {
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
+    }
+
+    /// Executes a `/command` line. Returns `true` when the TUI should exit.
+    fn execute_command(&mut self, raw: &str) -> bool {
+        let mut parts = raw[1..].split_whitespace();
+        let name = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let argument = parts.next();
+        match name.as_str() {
+            "quit" | "exit" => true,
+            "clear" => {
+                // Presentation-only: the durable event log stays intact.
+                self.transcript.clear();
+                self.scroll = 0;
+                self.follow_tail = true;
+                self.notice = Some("Cleared the transcript view.".to_owned());
+                false
+            }
+            "model" => match argument {
+                None => {
+                    self.open_model_picker();
+                    false
+                }
+                Some(spec) => {
+                    self.select_model_by_spec(spec);
+                    false
+                }
+            },
+            "reasoning" => match argument {
+                None => {
+                    self.cycle_effort();
+                    false
+                }
+                Some(level) => {
+                    self.set_effort(level);
+                    false
+                }
+            },
+            "" => {
+                self.notice = Some(
+                    "Usage: /new · /sessions · /model [provider/model] · /reasoning [effort] · /clear"
+                        .to_owned(),
+                );
+                false
+            }
+            other => {
+                self.notice = Some(format!(
+                    "Unknown command /{other}. Available: /new, /sessions, /model, /reasoning, /clear, /quit."
+                ));
+                false
+            }
+        }
+    }
+
+    /// Switches models from a `"provider-id/model-id"` spec, falling back to
+    /// a unique bare model-ID match.
+    fn select_model_by_spec(&mut self, spec: &str) {
+        let position = match spec.split_once('/') {
+            Some((provider_id, model)) => self
+                .choices
+                .iter()
+                .position(|choice| choice.provider_id == provider_id && choice.model == model),
+            None => {
+                let matches = self
+                    .choices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, choice)| choice.model == spec)
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                matches.first().copied().filter(|_| matches.len() == 1)
+            }
+        };
+        match position {
+            Some(index) => {
+                let name = format!(
+                    "{} / {}",
+                    self.choices[index].provider_name, self.choices[index].model
+                );
+                self.selected_model = index;
+                self.drop_unsupported_effort();
+                self.notice = Some(format!("Switched to {name}."));
+            }
+            None => {
+                self.notice = Some(format!("No model matches {spec:?}."));
+            }
+        }
+    }
+
+    /// Steps through no-effort and every effort level the active model
+    /// supports.
+    fn cycle_effort(&mut self) {
+        let mut levels = vec![None];
+        levels.extend(self.offered_efforts().iter().copied().map(Some));
+        let current = levels.iter().position(|level| *level == self.effort);
+        let next = current.map_or(0, |index| (index + 1) % levels.len());
+        self.effort = levels[next];
+        self.notice = Some(match self.effort {
+            Some(effort) => format!("Reasoning effort: {}.", effort.as_str()),
+            None => "Reasoning effort: default.".to_owned(),
+        });
+    }
+
+    fn set_effort(&mut self, raw_level: &str) {
+        match ReasoningEffort::parse(raw_level) {
+            Some(effort) if self.supports_effort(effort) => {
+                self.effort = Some(effort);
+                self.notice = Some(format!("Reasoning effort: {}.", effort.as_str()));
+            }
+            Some(_) => {
+                self.notice = Some(format!(
+                    "{} does not report supporting effort {raw_level:?}.",
+                    self.model_choice().model
+                ));
+            }
+            None => {
+                let levels = ReasoningEffort::ALL
+                    .map(|effort| effort.as_str())
+                    .join(", ");
+                self.notice = Some(format!("Unknown effort {raw_level:?}. Levels: {levels}."));
+            }
+        }
     }
 
     fn insert(&mut self, character: char) {
@@ -437,6 +849,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_transcript(frame, app, sections[1]);
     render_composer(frame, app, sections[2]);
     render_footer(frame, app, sections[3]);
+    if app.sessions_open {
+        render_sessions_picker(frame, app, area);
+    }
     if app.picker_open {
         render_model_picker(frame, app, area);
     }
@@ -465,6 +880,14 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(
             format!("{} / {}", model.provider_name, model.model),
             Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  ·  "),
+        Span::styled(
+            match app.effort {
+                Some(effort) => format!("effort {}", effort.as_str()),
+                None => "effort default".to_owned(),
+            },
+            Style::default().fg(Color::DarkGray),
         ),
         Span::raw("  ·  "),
         Span::styled(state, state_style(&app.run_state)),
@@ -655,6 +1078,85 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(picker, popup);
 }
 
+fn render_sessions_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(sessions) = &app.sessions else {
+        return;
+    };
+    let now = current_ms();
+    let height = u16::try_from(sessions.len().saturating_add(4))
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2));
+    let popup = centered_rect(70, height.max(5), area);
+    let lines = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            let marker = if index == app.sessions_cursor {
+                "› "
+            } else {
+                "  "
+            };
+            let style = if index == app.sessions_cursor {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(format!(
+                "{marker}{}  ·  last opened {}",
+                short_session_id(&summary.id),
+                relative_time(summary.last_opened_ms, now),
+            ))
+            .style(style)
+        })
+        .chain(std::iter::once(Line::default()))
+        .chain(std::iter::once(
+            Line::from("↑/↓ select  ·  Enter switch  ·  Esc close")
+                .style(Style::default().fg(Color::DarkGray)),
+        ))
+        .collect::<Vec<_>>();
+    let picker = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Sessions "),
+        )
+        .alignment(Alignment::Left);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(picker, popup);
+}
+
+/// Trims the deterministic prefix for display: `session-1a2b…-9c8d7e6f`.
+fn short_session_id(id: &str) -> String {
+    let rest = id.strip_prefix("session-").unwrap_or(id);
+    match rest.split_once('-') {
+        Some((fingerprint, suffix)) => {
+            format!("{}…{suffix}", &fingerprint[..4.min(fingerprint.len())])
+        }
+        None => id.to_owned(),
+    }
+}
+
+/// Coarse "time since" label; precise stamps live in session metadata.
+fn relative_time(past_ms: u64, now_ms: u64) -> String {
+    let seconds = now_ms.saturating_sub(past_ms) / 1000;
+    match seconds {
+        0..=59 => "just now".to_owned(),
+        60..=3599 => format!("{} min ago", seconds / 60),
+        3600..=86_399 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+fn current_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn centered_rect(width_percent: u16, height: u16, area: Rect) -> Rect {
     let vertical_margin = area.height.saturating_sub(height) / 2;
     let vertical = Layout::default()
@@ -739,18 +1241,58 @@ impl From<io::Error> for TuiError {
 
 #[cfg(test)]
 mod tests {
-    use nexa_protocol::{ApiFormat, Event, ProviderSummary, ToolCall, ToolResult};
+    use nexa_protocol::{
+        ApiFormat, Event, ModelSummary, ProviderSummary, ReasoningEffort, ToolCall, ToolResult,
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{App, RunState, Submission, ToolState, TranscriptItem, render};
 
     fn app() -> App {
-        App::new(vec![ProviderSummary {
-            id: "local".to_owned(),
-            name: "Local".to_owned(),
-            api_format: ApiFormat::ChatCompletions,
-            models: vec!["model".to_owned()],
-        }])
+        App::new(
+            vec![ProviderSummary {
+                id: "local".to_owned(),
+                name: "Local".to_owned(),
+                api_format: ApiFormat::ChatCompletions,
+                models: vec![ModelSummary {
+                    id: "model".to_owned(),
+                    reasoning_efforts: None,
+                }],
+            }],
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn app_with_choices() -> App {
+        App::new(
+            vec![ProviderSummary {
+                id: "local".to_owned(),
+                name: "Local".to_owned(),
+                api_format: ApiFormat::ChatCompletions,
+                models: vec![
+                    ModelSummary {
+                        id: "plain".to_owned(),
+                        reasoning_efforts: None,
+                    },
+                    ModelSummary {
+                        id: "thinker".to_owned(),
+                        reasoning_efforts: Some(vec![
+                            ReasoningEffort::Low,
+                            ReasoningEffort::High,
+                            ReasoningEffort::XHigh,
+                        ]),
+                    },
+                    ModelSummary {
+                        id: "limited".to_owned(),
+                        reasoning_efforts: Some(vec![ReasoningEffort::Minimal]),
+                    },
+                ],
+            }],
+            None,
+            None,
+        )
         .unwrap()
     }
 
@@ -918,5 +1460,92 @@ mod tests {
         assert!(rendered.contains("NEXA"));
         assert!(rendered.contains("Hello, Nexa"));
         assert!(rendered.contains("Message"));
+    }
+
+    #[test]
+    fn reasoning_command_sets_validated_efforts() {
+        let mut app = app_with_choices();
+        // "thinker" reports low / high / xhigh only.
+        app.execute_command("/model local/thinker");
+        assert_eq!(app.selected_model, 1);
+
+        app.execute_command("/reasoning xhigh");
+        assert_eq!(app.effort, Some(ReasoningEffort::XHigh));
+
+        app.execute_command("/reasoning minimal");
+        assert_eq!(
+            app.effort,
+            Some(ReasoningEffort::XHigh),
+            "unsupported levels must be rejected"
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("does not report supporting")
+        );
+
+        app.execute_command("/reasoning banana");
+        assert_eq!(app.effort, Some(ReasoningEffort::XHigh));
+        assert!(app.notice.as_deref().unwrap().contains("Unknown effort"));
+    }
+
+    #[test]
+    fn reasoning_without_argument_cycles_supported_levels() {
+        let mut app = app_with_choices();
+        app.selected_model = 1; // "thinker": low, high, xhigh
+
+        app.execute_command("/reasoning");
+        assert_eq!(app.effort, Some(ReasoningEffort::Low));
+        app.execute_command("/reasoning");
+        assert_eq!(app.effort, Some(ReasoningEffort::High));
+        app.execute_command("/reasoning");
+        assert_eq!(app.effort, Some(ReasoningEffort::XHigh));
+        app.execute_command("/reasoning");
+        assert_eq!(app.effort, None);
+    }
+
+    #[test]
+    fn model_command_switches_by_spec_or_bare_id_and_drops_efforts() {
+        let mut app = app_with_choices();
+        app.selected_model = 1;
+        app.effort = Some(ReasoningEffort::XHigh);
+
+        // "limited" only declares minimal, so xhigh must be dropped.
+        app.execute_command("/model local/limited");
+        assert_eq!(app.selected_model, 2);
+        assert_eq!(app.effort, None);
+        assert!(app.notice.as_deref().unwrap().contains("Switched"));
+
+        // Unknown capabilities never restrict the effort.
+        app.execute_command("/model local/plain");
+        assert_eq!(app.selected_model, 0);
+        app.effort = Some(ReasoningEffort::Max);
+
+        // Bare model IDs match when unique.
+        app.execute_command("/model limited");
+        assert_eq!(app.selected_model, 2);
+        assert_eq!(app.effort, None);
+
+        app.execute_command("/model nope/missing");
+        assert_eq!(app.selected_model, 2);
+        assert!(app.notice.as_deref().unwrap().contains("No model matches"));
+    }
+
+    #[test]
+    fn clear_command_resets_the_transcript_view_only() {
+        let mut app = app();
+        app.apply(Event::Message {
+            session_id: "local".to_owned(),
+            sequence: 1,
+            client_id: "cli".to_owned(),
+            model: app.model(),
+            text: "Hello, Nexa".to_owned(),
+            created_at_ms: 1,
+        });
+        assert!(!app.transcript.is_empty());
+
+        assert!(!app.execute_command("/clear"));
+        assert!(app.transcript.is_empty());
     }
 }

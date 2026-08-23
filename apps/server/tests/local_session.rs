@@ -5,8 +5,8 @@ use nexa_harness::{
     WorkspaceTools,
 };
 use nexa_protocol::{
-    ApiFormat, Command, Event, ModelMessage, ModelRef, OpenSessionRequest, ProviderSummary,
-    SessionInfo, ToolCall,
+    ApiFormat, Command, Event, ModelMessage, ModelRef, ModelSummary, ProviderSummary, SessionInfo,
+    ToolCall, WorkspaceRequest,
 };
 use nexa_runtime::{AgentFactory, SessionRegistry};
 use reqwest::{Client, Response, StatusCode};
@@ -172,26 +172,42 @@ async fn exposes_the_runtime_provider_catalog() -> TestResult {
         id: "deepseek".to_owned(),
         name: "DeepSeek".to_owned(),
         api_format: ApiFormat::ChatCompletions,
-        models: vec!["deepseek-chat".to_owned()],
+        models: vec![ModelSummary {
+            id: "deepseek-chat".to_owned(),
+            reasoning_efforts: None,
+        }],
     }];
     let server = tokio::spawn(async move {
-        nexa_server::serve_with_catalog(listener, registry, catalog, TEST_TOKEN.to_owned())
-            .await
-            .expect("test server should remain available");
+        nexa_server::serve_with_catalog(
+            listener,
+            registry,
+            catalog,
+            Vec::new(),
+            TEST_TOKEN.to_owned(),
+        )
+        .await
+        .expect("test server should remain available");
     });
 
-    let providers = Client::new()
+    let response = Client::new()
         .get(format!("{base_url}/providers"))
         .bearer_auth(TEST_TOKEN)
         .send()
         .await?
-        .error_for_status()?
-        .json::<Vec<ProviderSummary>>()
-        .await?;
+        .error_for_status()?;
+    assert_eq!(
+        response
+            .headers()
+            .get("x-nexa-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some(nexa_protocol::PROTOCOL_VERSION.to_string()).as_deref(),
+        "servers must advertise their protocol revision"
+    );
+    let providers = response.json::<Vec<ProviderSummary>>().await?;
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0].id, "deepseek");
-    assert_eq!(providers[0].models, ["deepseek-chat"]);
-
+    assert_eq!(providers[0].models.len(), 1);
+    assert_eq!(providers[0].models[0].id, "deepseek-chat");
     server.abort();
     Ok(())
 }
@@ -204,8 +220,8 @@ async fn rejects_workspace_access_without_the_local_server_token() -> TestResult
     let (base_url, server) = start_server(registry).await?;
 
     let response = Client::new()
-        .post(format!("{base_url}/sessions/open"))
-        .json(&OpenSessionRequest {
+        .post(format!("{base_url}/sessions/create"))
+        .json(&WorkspaceRequest {
             workspace: workspace.path().to_string_lossy().into_owned(),
         })
         .send()
@@ -222,7 +238,7 @@ async fn reports_corrupt_session_metadata_as_a_server_error() -> TestResult {
     let state = tempdir()?;
     let workspace = tempdir()?;
     let info = SessionRegistry::without_agent(state.path())
-        .open_workspace(workspace.path())
+        .create_session(workspace.path())
         .await?;
     tokio::fs::write(
         state.path().join(&info.id).join("session.json"),
@@ -348,9 +364,9 @@ async fn open_session(
     workspace: &Path,
 ) -> TestResult<SessionInfo> {
     Ok(client
-        .post(format!("{base_url}/sessions/open"))
+        .post(format!("{base_url}/sessions/create"))
         .bearer_auth(TEST_TOKEN)
-        .json(&OpenSessionRequest {
+        .json(&WorkspaceRequest {
             workspace: workspace
                 .to_str()
                 .ok_or("temporary workspace must be UTF-8")?
@@ -380,6 +396,8 @@ async fn send_message(
                 provider: "test-provider".to_owned(),
                 id: "test-model".to_owned(),
             },
+            preset: None,
+            reasoning_effort: None,
             text: text.to_owned(),
         })
         .send()

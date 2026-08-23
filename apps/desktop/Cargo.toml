@@ -1,24 +1,24 @@
 [package]
-name = "nexa-server"
+name = "nexa-desktop"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "nexa-desktop"
+path = "src/main.rs"
+
 [dependencies]
-axum.workspace = true
+eframe.workspace = true
+egui.workspace = true
 dirs.workspace = true
+epaint_default_fonts.workspace = true
+nexa-client.workspace = true
 nexa-harness.workspace = true
 nexa-protocol.workspace = true
-nexa-runtime.workspace = true
-serde.workspace = true
+rfd.workspace = true
 serde_json.workspace = true
-toml.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
-
-[dev-dependencies]
-reqwest.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

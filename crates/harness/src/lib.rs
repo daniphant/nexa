@@ -1,15 +1,22 @@
 mod config;
+mod local_server;
 mod openai;
+mod reasoning;
 mod tools;
 
 use std::sync::Arc;
 
 pub use config::{
-    CredentialFile, CredentialFileError, ProviderConfig, ProviderConfigError, ProviderCredential,
-    ProviderFile, load_or_create_server_token,
+    AuthStyle, CredentialFile, CredentialFileError, DefaultModel, DesktopSettings, ModelEntry,
+    ModelsSettings, ProviderConfig, ProviderConfigError, ProviderCredential, ProviderFile,
+    SettingsFile, SettingsFileError, load_or_create_server_token,
 };
-use nexa_protocol::{ModelMessage, ModelRef, ToolCall, ToolDefinition, ToolResult};
-pub use openai::ProviderRegistry;
+pub use local_server::{LocalServerError, ServerProbe, ensure_local_server};
+use nexa_protocol::{
+    ModelMessage, ModelRef, ReasoningEffort, ToolCall, ToolDefinition, ToolResult,
+};
+pub use openai::{ModelInfo, ProviderRegistry, discover_models};
+pub use reasoning::inferred_reasoning_efforts;
 use tokio::sync::mpsc;
 pub use tools::{WorkspaceTools, WorkspaceToolsError};
 
@@ -18,6 +25,10 @@ const MAX_TOOL_ROUNDS: usize = 16;
 #[derive(Clone, Debug)]
 pub struct AgentRequest {
     pub model: ModelRef,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// When set, only tool definitions whose names appear here are offered
+    /// to the provider (agent-preset scoping). `None` offers everything.
+    pub allowed_tools: Option<Vec<String>>,
     pub messages: Vec<ModelMessage>,
 }
 
@@ -45,6 +56,7 @@ pub trait Agent: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct InferenceRequest {
     pub model: ModelRef,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolDefinition>,
 }
@@ -118,11 +130,18 @@ async fn run_agent<T>(
 ) where
     T: ToolBridge,
 {
-    let definitions = tools.definitions();
-
     for _ in 0..MAX_TOOL_ROUNDS {
+        let definitions = tools.definitions();
+        let definitions = match &request.allowed_tools {
+            Some(allowed) => definitions
+                .into_iter()
+                .filter(|definition| allowed.contains(&definition.name))
+                .collect(),
+            None => definitions,
+        };
         let mut provider_events = provider.stream(InferenceRequest {
             model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort,
             messages: request.messages.clone(),
             tools: definitions.clone(),
         });
@@ -204,7 +223,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use nexa_protocol::{ModelMessage, ModelRef, ToolCall};
+    use nexa_protocol::{ModelMessage, ModelRef, ReasoningEffort, ToolCall};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
@@ -266,6 +285,8 @@ mod tests {
                 provider: "test-provider".to_owned(),
                 id: "test-model".to_owned(),
             },
+            reasoning_effort: Some(ReasoningEffort::Low),
+            allowed_tools: Some(vec!["read_file".to_owned()]),
             messages: vec![ModelMessage::User {
                 content: "Read the notes".to_owned(),
             }],

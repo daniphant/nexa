@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event as SseEvent, sse::KeepAlive},
     routing::{get, post},
 };
-use nexa_protocol::{AcceptedCommand, Command, OpenSessionRequest, ProviderSummary};
+use nexa_protocol::{AcceptedCommand, Command, PresetSummary, ProviderSummary, WorkspaceRequest};
 use nexa_runtime::{RegistryError, SessionError, SessionRegistry};
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -18,46 +18,100 @@ pub async fn serve(
     sessions: SessionRegistry,
     auth_token: String,
 ) -> std::io::Result<()> {
-    serve_with_catalog(listener, sessions, Vec::new(), auth_token).await
+    serve_with_catalog(listener, sessions, Vec::new(), Vec::new(), auth_token).await
 }
 
 pub async fn serve_with_catalog(
     listener: TcpListener,
     sessions: SessionRegistry,
     providers: Vec<ProviderSummary>,
+    presets: Vec<(String, Vec<String>)>,
     auth_token: String,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(sessions, providers, auth_token)).await
+    axum::serve(listener, router(sessions, providers, presets, auth_token)).await
 }
 
 #[derive(Clone)]
 struct AppState {
     sessions: SessionRegistry,
     providers: Arc<[ProviderSummary]>,
+    /// Loaded agent presets: name -> tool allow-list (empty = every tool).
+    presets: Arc<[(String, Vec<String>)]>,
     auth_token: Arc<str>,
+}
+
+fn resolve_preset(
+    state: &AppState,
+    preset: &Option<String>,
+) -> Result<Option<Vec<String>>, StatusCode> {
+    let Some(name) = preset else {
+        return Ok(None);
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    match state
+        .presets
+        .iter()
+        .find(|(preset_name, _)| preset_name == name)
+    {
+        Some((_, tools)) => Ok(Some(tools.clone())),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+fn preset_summaries(state: &AppState) -> Vec<PresetSummary> {
+    state
+        .presets
+        .iter()
+        .map(|(name, tools)| PresetSummary {
+            name: name.clone(),
+            description: String::new(),
+            tools: tools.clone(),
+        })
+        .collect()
 }
 
 fn router(
     sessions: SessionRegistry,
     providers: Vec<ProviderSummary>,
+    presets: Vec<(String, Vec<String>)>,
     auth_token: String,
 ) -> Router {
     Router::new()
         .route("/commands", post(accept_command))
+        .route("/presets", get(preset_catalog))
         .route("/providers", get(provider_catalog))
-        .route("/sessions/open", post(open_session))
+        .route("/sessions/create", post(create_session))
+        .route("/sessions/list", post(list_sessions))
         .route("/sessions/{session_id}/events", get(event_stream))
         .with_state(AppState {
             sessions,
             providers: providers.into(),
+            presets: presets.into(),
             auth_token: Arc::from(auth_token),
         })
+        .layer(axum::middleware::map_response(protocol_version_header))
 }
 
-async fn open_session(
+async fn preset_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authenticated(&headers, &state) {
+        return authentication_required();
+    }
+    (StatusCode::OK, Json(preset_summaries(&state))).into_response()
+}
+
+/// Advertises the wire-protocol revision so clients can detect stale servers.
+async fn protocol_version_header(mut response: Response) -> Response {
+    let value = nexa_protocol::PROTOCOL_VERSION.into();
+    response.headers_mut().insert("x-nexa-protocol", value);
+    response
+}
+
+async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<OpenSessionRequest>,
+    Json(request): Json<WorkspaceRequest>,
 ) -> Response {
     if !authenticated(&headers, &state) {
         return authentication_required();
@@ -65,8 +119,25 @@ async fn open_session(
     if request.workspace.trim().is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "workspace must not be empty");
     }
-    match state.sessions.open_workspace(request.workspace).await {
-        Ok(info) => (StatusCode::OK, Json(info)).into_response(),
+    match state.sessions.create_session(request.workspace).await {
+        Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
+        Err(error) => registry_error_response(error),
+    }
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<WorkspaceRequest>,
+) -> Response {
+    if !authenticated(&headers, &state) {
+        return authentication_required();
+    }
+    if request.workspace.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "workspace must not be empty");
+    }
+    match state.sessions.list_sessions(request.workspace).await {
+        Ok(summaries) => (StatusCode::OK, Json(summaries)).into_response(),
         Err(error) => registry_error_response(error),
     }
 }
@@ -85,6 +156,8 @@ async fn accept_command(State(state): State<AppState>, request: Request) -> Resp
             session_id,
             client_id,
             model,
+            preset,
+            reasoning_effort,
             text,
         } => {
             let session_id = session_id.trim();
@@ -93,6 +166,24 @@ async fn accept_command(State(state): State<AppState>, request: Request) -> Resp
                 provider: model.provider.trim().to_owned(),
                 id: model.id.trim().to_owned(),
             };
+            let allowed_tools = match resolve_preset(&state, &preset) {
+                Ok(tools) => tools,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        &format!(
+                            "unknown agent preset {:?}",
+                            preset.as_deref().unwrap_or_default()
+                        ),
+                    );
+                }
+            };
+            if preset.as_ref().is_some_and(|name| name.is_empty()) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "preset must not be empty when provided",
+                );
+            }
             let text = text.trim();
             if session_id.is_empty()
                 || client_id.is_empty()
@@ -110,7 +201,10 @@ async fn accept_command(State(state): State<AppState>, request: Request) -> Resp
                 Ok(session) => session,
                 Err(error) => return registry_error_response(error),
             };
-            match session.append_message(client_id, &model, text).await {
+            match session
+                .append_message(client_id, &model, reasoning_effort, allowed_tools, text)
+                .await
+            {
                 Ok(event) => (
                     StatusCode::CREATED,
                     Json(AcceptedCommand {

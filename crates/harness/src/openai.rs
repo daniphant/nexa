@@ -1,15 +1,18 @@
-use std::{collections::BTreeMap, env};
+use std::{collections::BTreeMap, env, time::Duration};
 
 use futures_util::StreamExt;
-use nexa_protocol::{ModelMessage, ModelRef, ProviderSummary, ToolCall, ToolDefinition};
-use reqwest::Client;
+use nexa_protocol::{
+    ModelMessage, ModelRef, ModelSummary, ProviderSummary, ReasoningEffort, ToolCall,
+    ToolDefinition,
+};
+use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    CredentialFile, InferenceRequest, Provider, ProviderConfig, ProviderConfigError, ProviderEvent,
-    ProviderFile,
+    AuthStyle, CredentialFile, InferenceRequest, Provider, ProviderConfig, ProviderConfigError,
+    ProviderEvent, ProviderFile,
 };
 
 pub struct ProviderRegistry {
@@ -52,7 +55,21 @@ impl ProviderRegistry {
                 id: id.clone(),
                 name: provider.config.name.clone(),
                 api_format: provider.config.api_format,
-                models: provider.config.models.clone(),
+                models: provider
+                    .config
+                    .models
+                    .iter()
+                    .map(|model| ModelSummary {
+                        id: model.id().to_owned(),
+                        reasoning_efforts: model
+                            .reasoning_efforts()
+                            .map(<[ReasoningEffort]>::to_vec)
+                            .or_else(|| {
+                                crate::inferred_reasoning_efforts(model.id())
+                                    .map(<[ReasoningEffort]>::to_vec)
+                            }),
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -69,7 +86,12 @@ impl Provider for ProviderRegistry {
             .providers
             .get(&model.provider)
             .ok_or_else(|| format!("unknown provider {:?}", model.provider))?;
-        if !provider.config.models.contains(&model.id) {
+        if !provider
+            .config
+            .models
+            .iter()
+            .any(|entry| entry.id() == model.id)
+        {
             return Err(format!(
                 "provider {:?} does not offer model {:?}",
                 model.provider, model.id
@@ -101,7 +123,13 @@ impl Provider for ProviderRegistry {
             },
             None => provider.api_key.clone(),
         };
-        OpenAiProvider::new(&provider.config.base_url, &request.model.id, api_key).stream(request)
+        OpenAiProvider::new(
+            &provider.config.base_url,
+            &request.model.id,
+            api_key,
+            provider.config.auth,
+        )
+        .stream(request)
     }
 }
 
@@ -111,21 +139,196 @@ fn error_stream(error: String) -> mpsc::UnboundedReceiver<Result<ProviderEvent, 
     receiver
 }
 
+/// Applies provider credentials to a request using the configured header
+/// style: `Authorization: Bearer` or the Anthropic-style `x-api-key`.
+fn apply_auth(request: RequestBuilder, api_key: Option<&str>, auth: AuthStyle) -> RequestBuilder {
+    match api_key {
+        Some(api_key) => match auth {
+            AuthStyle::Bearer => request.bearer_auth(api_key),
+            AuthStyle::XApiKey => request.header("x-api-key", api_key),
+        },
+        None => request,
+    }
+}
+
+/// One model reported by a provider's models listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Effort levels declared for this model, or `None` when the endpoint
+    /// does not say. A declaration without recognizable levels resolves to
+    /// [`ReasoningEffort::COMMON`].
+    pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
+}
+
+/// Parameter names that mark reasoning support inside parameter-list fields.
+const REASONING_PARAM_NAMES: [&str; 2] = ["reasoning_effort", "reasoning"];
+/// Provider-specific parameter-list fields (OpenRouter, LiteLLM).
+const SUPPORTED_PARAM_FIELDS: [&str; 2] = ["supported_parameters", "supported_openai_params"];
+/// Boolean capability flags (LM Studio-style endpoints).
+const REASONING_FLAG_FIELDS: [&str; 2] = ["reasoning", "supports_reasoning"];
+/// Fields carrying explicit effort levels when an endpoint enumerates them.
+const EFFORT_LIST_FIELDS: [&str; 2] = ["reasoning_efforts", "supported_reasoning_efforts"];
+
+fn reported_reasoning_efforts(extra: &BTreeMap<String, Value>) -> Option<Vec<ReasoningEffort>> {
+    for field in EFFORT_LIST_FIELDS {
+        if let Some(Value::Array(levels)) = extra.get(field) {
+            let parsed = levels
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(ReasoningEffort::parse)
+                .collect::<Vec<_>>();
+            if !parsed.is_empty() {
+                // Canonical order regardless of how the endpoint listed them.
+                return Some(
+                    ReasoningEffort::ALL
+                        .into_iter()
+                        .filter(|level| parsed.contains(level))
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    for field in SUPPORTED_PARAM_FIELDS {
+        if let Some(Value::Array(parameters)) = extra.get(field)
+            && parameters
+                .iter()
+                .any(|parameter| {
+                    matches!(parameter.as_str(), Some(name) if REASONING_PARAM_NAMES.contains(&name))
+                })
+        {
+            return Some(ReasoningEffort::COMMON.to_vec());
+        }
+    }
+
+    for field in REASONING_FLAG_FIELDS {
+        if extra.get(field).and_then(Value::as_bool) == Some(true) {
+            return Some(ReasoningEffort::COMMON.to_vec());
+        }
+    }
+
+    if let Some(Value::Object(capabilities)) = extra.get("capabilities")
+        && ["reasoning", "thinking"]
+            .iter()
+            .any(|field| capabilities.get(*field).and_then(Value::as_bool) == Some(true))
+    {
+        return Some(ReasoningEffort::COMMON.to_vec());
+    }
+
+    None
+}
+
+/// Queries an OpenAI-compatible server's `GET {base_url}/models` endpoint and
+/// returns its models in case-insensitive alphabetical order.
+///
+/// Capability extensions are picked up opportunistically: parameter lists such
+/// as OpenRouter's `supported_parameters` or LiteLLM's
+/// `supported_openai_params` mark reasoning support, and boolean fields like
+/// `reasoning` do the same on LM Studio-style endpoints. Endpoints without any
+/// extension yield `None`, meaning unknown rather than unsupported.
+///
+/// # Errors
+///
+/// Returns an error when the request fails, the response status is not
+/// successful, or the body is not a recognizable model listing.
+pub async fn discover_models(
+    base_url: &str,
+    api_key: Option<&str>,
+    auth: AuthStyle,
+) -> Result<Vec<ModelInfo>, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let request = Client::new().get(&url).timeout(Duration::from_secs(15));
+    let response = apply_auth(request, api_key, auth)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("could not read error response: {error}"));
+        return Err(format!("model listing returned {status}: {body}"));
+    }
+    let listing: ModelListing = response
+        .json()
+        .await
+        .map_err(|error| format!("invalid model listing response: {error}"))?;
+
+    let mut models = listing.models();
+    models.sort_by_key(|model| model.id.to_lowercase());
+    models.dedup_by(|left, right| left.id.to_lowercase() == right.id.to_lowercase());
+    Ok(models)
+}
+
+#[derive(Deserialize)]
+struct ModelListing {
+    #[serde(default, alias = "models")]
+    data: Vec<ModelListingEntry>,
+}
+
+impl ModelListing {
+    fn models(self) -> Vec<ModelInfo> {
+        self.data
+            .into_iter()
+            .map(|entry| match entry {
+                ModelListingEntry::Identified { id, extra } => {
+                    let reasoning_efforts = reported_reasoning_efforts(&extra).or_else(|| {
+                        crate::inferred_reasoning_efforts(&id).map(<[ReasoningEffort]>::to_vec)
+                    });
+                    ModelInfo {
+                        id,
+                        reasoning_efforts,
+                    }
+                }
+                ModelListingEntry::Named(id) => {
+                    let reasoning_efforts =
+                        crate::inferred_reasoning_efforts(&id).map(<[ReasoningEffort]>::to_vec);
+                    ModelInfo {
+                        id,
+                        reasoning_efforts,
+                    }
+                }
+            })
+            .filter(|model| !model.id.trim().is_empty())
+            .collect()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ModelListingEntry {
+    Identified {
+        id: String,
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
+    Named(String),
+}
+
 struct OpenAiProvider {
     client: Client,
     endpoint: String,
     model: String,
     api_key: Option<String>,
+    auth: AuthStyle,
 }
 
 impl OpenAiProvider {
     #[must_use]
-    fn new(base_url: &str, model: impl Into<String>, api_key: Option<String>) -> Self {
+    fn new(
+        base_url: &str,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        auth: AuthStyle,
+    ) -> Self {
         Self {
             client: Client::new(),
             endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             model: model.into(),
             api_key,
+            auth,
         }
     }
 }
@@ -139,10 +342,11 @@ impl Provider for OpenAiProvider {
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
         let api_key = self.api_key.clone();
+        let auth = self.auth;
         let (events, receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             if let Err(error) =
-                stream_response(client, endpoint, model, api_key, request, &events).await
+                stream_response(client, endpoint, model, api_key, auth, request, &events).await
             {
                 let _ = events.send(Err(error));
             }
@@ -157,19 +361,25 @@ async fn stream_response(
     endpoint: String,
     model: String,
     api_key: Option<String>,
+    auth: AuthStyle,
     request: InferenceRequest,
     events: &mpsc::UnboundedSender<Result<ProviderEvent, String>>,
 ) -> Result<(), String> {
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
         "tools": request.tools.iter().map(tool_json).collect::<Vec<_>>(),
         "stream": true,
     });
-    let mut request = client.post(endpoint).json(&body);
-    if let Some(api_key) = api_key {
-        request = request.bearer_auth(api_key);
+    if let Some(effort) = request.reasoning_effort {
+        // Chat Completions spelling. LiteLLM proxies that classify the model as
+        // OpenAI reject this unless the request lists it as allowed; xAI also
+        // accepts the nested `reasoning.effort` object.
+        body["reasoning_effort"] = json!(effort);
+        body["reasoning"] = json!({ "effort": effort });
+        body["allowed_openai_params"] = json!(["reasoning_effort"]);
     }
+    let request = apply_auth(client.post(endpoint).json(&body), api_key.as_deref(), auth);
 
     let response = request.send().await.map_err(|error| error.to_string())?;
     let status = response.status();
@@ -416,17 +626,17 @@ fn parse_frame(frame: &[u8]) -> Result<String, String> {
 mod tests {
     use axum::{
         Json, Router,
-        http::{HeaderMap, header},
+        http::{HeaderMap, StatusCode, header},
         response::IntoResponse,
-        routing::post,
+        routing::{get, post},
     };
-    use nexa_protocol::{ModelMessage, ModelRef, ToolDefinition};
+    use nexa_protocol::{ModelMessage, ModelRef, ReasoningEffort, ToolDefinition};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
 
-    use crate::{InferenceRequest, Provider, ProviderEvent};
+    use crate::{AuthStyle, InferenceRequest, Provider, ProviderEvent};
 
-    use super::{OpenAiProvider, SseDecoder};
+    use super::{ModelInfo, OpenAiProvider, SseDecoder, discover_models};
 
     #[test]
     fn decodes_split_crlf_frames() {
@@ -453,12 +663,18 @@ mod tests {
             .await
             .unwrap();
         });
-        let provider = OpenAiProvider::new(&base_url, "test-model", Some("test-key".to_owned()));
+        let provider = OpenAiProvider::new(
+            &base_url,
+            "test-model",
+            Some("test-key".to_owned()),
+            AuthStyle::Bearer,
+        );
         let mut stream = provider.stream(InferenceRequest {
             model: ModelRef {
                 provider: "test-provider".to_owned(),
                 id: "test-model".to_owned(),
             },
+            reasoning_effort: None,
             messages: vec![ModelMessage::User {
                 content: "read the notes".to_owned(),
             }],
@@ -485,6 +701,242 @@ mod tests {
             ProviderEvent::Completed
         ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovers_sorted_unique_model_ids() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/models", get(mock_models)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let models = discover_models(&base_url, Some("test-key"), AuthStyle::Bearer)
+            .await
+            .unwrap();
+        assert_eq!(
+            models,
+            vec![
+                ModelInfo {
+                    id: "a-model".to_owned(),
+                    reasoning_efforts: None,
+                },
+                ModelInfo {
+                    id: "b-model".to_owned(),
+                    reasoning_efforts: None,
+                },
+                ModelInfo {
+                    id: "c-model".to_owned(),
+                    reasoning_efforts: None,
+                },
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovers_reasoning_capabilities_from_listing_extensions() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/models", get(mock_capability_models))
+                    .route("/models", get(mock_flag_models)),
+            )
+            .await
+            .unwrap();
+        });
+
+        // OpenRouter-style parameter lists.
+        let models = discover_models(
+            &format!("{base_url}/v1"),
+            Some("test-key"),
+            AuthStyle::Bearer,
+        )
+        .await
+        .unwrap();
+        // Sorted order: enumerated, glm-5, litellm-model, plain.
+        assert_eq!(models[0].id, "enumerated");
+        // Explicit level enumeration wins when present.
+        assert_eq!(
+            models[0].reasoning_efforts,
+            Some(vec![ReasoningEffort::Low, ReasoningEffort::XHigh])
+        );
+        // OpenRouter-style parameter lists.
+        assert_eq!(
+            models[1].reasoning_efforts,
+            Some(ReasoningEffort::COMMON.to_vec())
+        );
+        // LiteLLM-style parameter lists.
+        assert_eq!(
+            models[2].reasoning_efforts,
+            Some(ReasoningEffort::COMMON.to_vec())
+        );
+        // Plain entries stay unknown.
+        assert_eq!(models[3].id, "plain");
+        assert_eq!(models[3].reasoning_efforts, None);
+
+        // LM Studio-style boolean flags.
+        let models = discover_models(&base_url, Some("test-key"), AuthStyle::XApiKey)
+            .await
+            .unwrap();
+        assert_eq!(
+            models[0].reasoning_efforts,
+            Some(ReasoningEffort::COMMON.to_vec())
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn discovers_with_an_x_api_key_header() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/models", get(expect_x_api_key)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let models = discover_models(&base_url, Some("test-key"), AuthStyle::XApiKey)
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "thinking-local");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn surfaces_model_listing_failures() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/models", get(|| async { StatusCode::UNAUTHORIZED })),
+            )
+            .await
+            .unwrap();
+        });
+
+        let error = discover_models(&base_url, None, AuthStyle::Bearer)
+            .await
+            .unwrap_err();
+        assert!(error.contains("401"), "unexpected error: {error}");
+        server.abort();
+    }
+
+    async fn expect_x_api_key(headers: HeaderMap) -> impl IntoResponse {
+        assert_eq!(headers.get("x-api-key").unwrap(), "test-key");
+        assert!(headers.get(header::AUTHORIZATION).is_none());
+        Json(json!({
+            "data": [
+                {
+                    "id": "thinking-local",
+                    "capabilities": {"vision": false, "reasoning": true},
+                },
+            ]
+        }))
+    }
+
+    async fn mock_capability_models(headers: HeaderMap) -> impl IntoResponse {
+        assert_eq!(
+            headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer test-key"
+        );
+        Json(json!({
+            "data": [
+                {
+                    "id": "glm-5",
+                    "supported_parameters": ["temperature", "reasoning_effort"],
+                },
+                {
+                    "id": "litellm-model",
+                    "supported_openai_params": ["reasoning_effort", "max_tokens"],
+                },
+                {
+                    "id": "enumerated",
+                    "supported_reasoning_efforts": ["xhigh", "low", "banana"],
+                },
+                {"id": "plain"},
+            ]
+        }))
+    }
+
+    async fn mock_flag_models(headers: HeaderMap) -> impl IntoResponse {
+        assert_eq!(headers.get("x-api-key").unwrap(), "test-key");
+        Json(json!({
+            "models": [
+                {"id": "flagged", "supports_reasoning": true},
+            ]
+        }))
+    }
+
+    async fn mock_models(headers: HeaderMap) -> impl IntoResponse {
+        assert_eq!(
+            headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer test-key"
+        );
+        Json(json!({
+            "data": [
+                {"id": "b-model"},
+                {"id": ""},
+                {"id": "a-model"},
+                {"id": "c-model"},
+                {"id": "a-model"},
+            ]
+        }))
+    }
+
+    #[tokio::test]
+    async fn sends_reasoning_effort_when_requested() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/chat/completions", post(mock_reasoning_completion)),
+            )
+            .await
+            .unwrap();
+        });
+        let provider = OpenAiProvider::new(&base_url, "test-model", None, AuthStyle::Bearer);
+        let mut stream = provider.stream(InferenceRequest {
+            model: ModelRef {
+                provider: "test-provider".to_owned(),
+                id: "test-model".to_owned(),
+            },
+            reasoning_effort: Some(ReasoningEffort::XHigh),
+            messages: vec![ModelMessage::User {
+                content: "hi".to_owned(),
+            }],
+            tools: Vec::new(),
+        });
+
+        assert!(matches!(
+            stream.recv().await.unwrap().unwrap(),
+            ProviderEvent::Completed
+        ));
+        server.abort();
+    }
+
+    async fn mock_reasoning_completion(Json(body): Json<Value>) -> impl IntoResponse {
+        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["allowed_openai_params"], json!(["reasoning_effort"]));
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            "data: {\"choices\":[]}\n\ndata: [DONE]\n\n",
+        )
     }
 
     async fn mock_completion(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {

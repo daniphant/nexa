@@ -10,7 +10,8 @@ use std::{
 };
 
 use nexa_harness::{Agent, AgentEvent, AgentRequest};
-use nexa_protocol::{Event, ModelMessage, ModelRef, SessionInfo};
+use nexa_protocol::{Event, ModelMessage, ModelRef, ReasoningEffort, SessionInfo, SessionSummary};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -20,6 +21,53 @@ use tokio::{
 
 const METADATA_FILE: &str = "session.json";
 const EVENT_LOG_FILE: &str = "events.ndjson";
+
+async fn canonical_workspace(workspace: &Path) -> Result<String, RegistryError> {
+    let workspace = fs::canonicalize(workspace)
+        .await
+        .map_err(RegistryError::Workspace)?;
+    let metadata = fs::metadata(&workspace)
+        .await
+        .map_err(RegistryError::Workspace)?;
+    if !metadata.is_dir() {
+        return Err(RegistryError::InvalidWorkspace(
+            "workspace must be a directory".to_owned(),
+        ));
+    }
+    workspace
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| RegistryError::InvalidWorkspace("workspace must be UTF-8".to_owned()))
+}
+
+async fn persist_metadata(
+    metadata_path: &Path,
+    meta: &PersistedSession,
+) -> Result<(), RegistryError> {
+    let metadata = serde_json::to_vec_pretty(meta)
+        .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
+    atomic_write(metadata_path, metadata).await?;
+    Ok(())
+}
+
+/// Merges on-disk and in-memory copies of session metadata by ID, keeping the
+/// freshest activity stamp of each.
+fn merge_known(metadatas: Vec<PersistedSession>) -> Vec<PersistedSession> {
+    let mut by_id: HashMap<String, PersistedSession> = HashMap::new();
+    for meta in metadatas {
+        match by_id.get_mut(&meta.id) {
+            Some(existing) => {
+                if meta.last_opened_ms > existing.last_opened_ms {
+                    *existing = meta;
+                }
+            }
+            None => {
+                by_id.insert(meta.id.clone(), meta);
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
 
 pub trait AgentFactory: Send + Sync {
     fn create(&self, workspace: &Path) -> Result<Option<Arc<dyn Agent>>, String>;
@@ -34,8 +82,29 @@ pub struct SessionRegistry {
 
 #[derive(Clone)]
 struct OpenSession {
-    info: SessionInfo,
+    meta: PersistedSession,
     runtime: LocalSession,
+}
+
+impl OpenSession {
+    fn info(&self) -> SessionInfo {
+        SessionInfo {
+            id: self.meta.id.clone(),
+            workspace: self.meta.workspace.clone(),
+        }
+    }
+}
+
+/// On-disk session metadata. Identity fields (`id`, `workspace`) are
+/// immutable once written; activity timestamps update on open.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedSession {
+    id: String,
+    workspace: String,
+    #[serde(default)]
+    created_at_ms: u64,
+    #[serde(default)]
+    last_opened_ms: u64,
 }
 
 impl SessionRegistry {
@@ -56,45 +125,127 @@ impl SessionRegistry {
         Self::new(sessions_directory, Arc::new(NoAgentFactory))
     }
 
-    pub async fn open_workspace(
+    /// Creates and opens a brand-new session bound to `workspace`.
+    pub async fn create_session(
         &self,
         workspace: impl AsRef<Path>,
     ) -> Result<SessionInfo, RegistryError> {
-        let workspace = fs::canonicalize(workspace.as_ref())
-            .await
-            .map_err(RegistryError::Workspace)?;
-        let metadata = fs::metadata(&workspace)
-            .await
-            .map_err(RegistryError::Workspace)?;
-        if !metadata.is_dir() {
-            return Err(RegistryError::InvalidWorkspace(
-                "workspace must be a directory".to_owned(),
-            ));
-        }
-        let workspace = workspace
-            .to_str()
-            .ok_or_else(|| RegistryError::InvalidWorkspace("workspace must be UTF-8".to_owned()))?
-            .to_owned();
-        let info = SessionInfo {
-            id: default_session_id(&workspace),
-            workspace,
-        };
-
-        let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(&info.id) {
-            if session.info != info {
-                return Err(RegistryError::InvalidMetadata(
-                    "session ID is already bound to another workspace".to_owned(),
-                ));
+        let workspace = canonical_workspace(workspace.as_ref()).await?;
+        // Random IDs collide with probability ~0, but retry regardless.
+        for _ in 0..4 {
+            let id = unique_session_id(&workspace)?;
+            let exists = fs::try_exists(self.session_directory(&id))
+                .await
+                .unwrap_or(true);
+            if exists {
+                continue;
             }
-            return Ok(session.info.clone());
+            let meta = PersistedSession {
+                id,
+                workspace: workspace.clone(),
+                created_at_ms: timestamp_ms(),
+                last_opened_ms: 0,
+            };
+            return self.open_meta(meta, true).await;
         }
-        let session = self.load_or_create(info, true).await?;
-        let info = session.info.clone();
-        sessions.insert(info.id.clone(), session);
+        Err(RegistryError::InvalidMetadata(
+            "could not allocate a unique session ID".to_owned(),
+        ))
+    }
+
+    /// Sessions previously bound to `workspace`, most recently opened first.
+    pub async fn list_sessions(
+        &self,
+        workspace: impl AsRef<Path>,
+    ) -> Result<Vec<SessionSummary>, RegistryError> {
+        let workspace = canonical_workspace(workspace.as_ref()).await?;
+        let mut known = self.scan_workspace_sessions(&workspace).await?;
+        let sessions = self.sessions.lock().await;
+        for session in sessions.values() {
+            if session.meta.workspace == workspace {
+                known.push(session.meta.clone());
+            }
+        }
+        drop(sessions);
+
+        let mut known = merge_known(known);
+        known.sort_by_key(|meta| std::cmp::Reverse(meta.last_opened_ms));
+        Ok(known
+            .into_iter()
+            .map(|meta| SessionSummary {
+                id: meta.id,
+                created_at_ms: meta.created_at_ms,
+                last_opened_ms: meta.last_opened_ms,
+            })
+            .collect())
+    }
+
+    /// Opens the freshly created session, persisting its metadata and
+    /// spawning its runtime actor.
+    async fn open_meta(
+        &self,
+        mut meta: PersistedSession,
+        allow_create: bool,
+    ) -> Result<SessionInfo, RegistryError> {
+        validate_session_id(&meta.id)?;
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&meta.id) {
+            session.meta.last_opened_ms = timestamp_ms();
+            return Ok(session.info());
+        }
+
+        let directory = self.session_directory(&meta.id);
+        let metadata_path = directory.join(METADATA_FILE);
+        let event_log_path = directory.join(EVENT_LOG_FILE);
+        match fs::read(&metadata_path).await {
+            Ok(contents) => {
+                let persisted: PersistedSession = serde_json::from_slice(&contents)
+                    .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
+                if persisted.id != meta.id || persisted.workspace != meta.workspace {
+                    return Err(RegistryError::InvalidMetadata(
+                        "session metadata does not match its workspace binding".to_owned(),
+                    ));
+                }
+                meta.created_at_ms = persisted.created_at_ms;
+                meta.last_opened_ms = persisted.last_opened_ms;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && allow_create => {
+                fs::create_dir_all(&directory).await?;
+                if meta.created_at_ms == 0 {
+                    meta.created_at_ms = timestamp_ms();
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(RegistryError::NotFound(meta.id));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        meta.last_opened_ms = timestamp_ms();
+        persist_metadata(&metadata_path, &meta).await?;
+
+        let workspace = canonical_workspace(Path::new(&meta.workspace))
+            .await
+            .map_err(|error| match error {
+                RegistryError::InvalidWorkspace(message) => RegistryError::InvalidMetadata(message),
+                other => other,
+            })?;
+        let agent = self
+            .agent_factory
+            .create(Path::new(&workspace))
+            .map_err(RegistryError::Agent)?;
+        let runtime = match agent {
+            Some(agent) => LocalSession::open_with_agent(&meta.id, event_log_path, agent).await?,
+            None => LocalSession::open(&meta.id, event_log_path).await?,
+        };
+        let info = SessionInfo {
+            id: meta.id.clone(),
+            workspace: meta.workspace.clone(),
+        };
+        sessions.insert(meta.id.clone(), OpenSession { meta, runtime });
         Ok(info)
     }
 
+    /// Opens an existing session by ID without touching its activity stamp.
     pub async fn session(&self, session_id: &str) -> Result<LocalSession, RegistryError> {
         validate_session_id(session_id)?;
         let mut sessions = self.sessions.lock().await;
@@ -110,137 +261,72 @@ impl SessionRegistry {
             }
             Err(error) => return Err(error.into()),
         };
-        let info: SessionInfo = serde_json::from_slice(&contents)
+        let meta: PersistedSession = serde_json::from_slice(&contents)
             .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
-        if info.id != session_id {
+        if meta.id != session_id {
             return Err(RegistryError::InvalidMetadata(format!(
                 "session metadata ID {:?} does not match {session_id:?}",
-                info.id
+                meta.id
             )));
         }
-        let session = self.load_or_create(info, false).await?;
-        let runtime = session.runtime.clone();
-        sessions.insert(session_id.to_owned(), session);
-        Ok(runtime)
-    }
-
-    async fn load_or_create(
-        &self,
-        info: SessionInfo,
-        create: bool,
-    ) -> Result<OpenSession, RegistryError> {
-        if default_session_id(&info.workspace) != info.id {
-            return Err(RegistryError::InvalidMetadata(
-                "session ID does not match its workspace".to_owned(),
-            ));
-        }
-        let workspace = fs::canonicalize(&info.workspace)
-            .await
-            .map_err(RegistryError::Workspace)?;
-        if workspace.to_str() != Some(info.workspace.as_str()) {
-            return Err(RegistryError::InvalidMetadata(
-                "session workspace is not canonical".to_owned(),
-            ));
-        }
-
-        let session_directory = self.session_directory(&info.id);
-        let metadata_path = session_directory.join(METADATA_FILE);
-        let event_log_path = session_directory.join(EVENT_LOG_FILE);
-        match fs::read(&metadata_path).await {
-            Ok(contents) => {
-                let persisted: SessionInfo = serde_json::from_slice(&contents)
-                    .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
-                if persisted != info {
-                    return Err(RegistryError::InvalidMetadata(
-                        "session metadata does not match its workspace binding".to_owned(),
-                    ));
-                }
-            }
-            Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&session_directory).await?;
-                self.migrate_legacy_log(&event_log_path, &info.id).await?;
-                let metadata = serde_json::to_vec_pretty(&info)
-                    .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
-                atomic_write(&metadata_path, metadata).await?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(RegistryError::NotFound(info.id));
-            }
-            Err(error) => return Err(error.into()),
-        }
-
+        let event_log_path = self.session_directory(session_id).join(EVENT_LOG_FILE);
+        let workspace = PathBuf::from(&meta.workspace);
         let agent = self
             .agent_factory
             .create(&workspace)
             .map_err(RegistryError::Agent)?;
         let runtime = match agent {
-            Some(agent) => LocalSession::open_with_agent(&info.id, event_log_path, agent).await?,
-            None => LocalSession::open(&info.id, event_log_path).await?,
+            Some(agent) => LocalSession::open_with_agent(session_id, event_log_path, agent).await?,
+            None => LocalSession::open(session_id, event_log_path).await?,
         };
-        Ok(OpenSession { info, runtime })
-    }
-
-    async fn migrate_legacy_log(
-        &self,
-        event_log_path: &Path,
-        session_id: &str,
-    ) -> Result<(), RegistryError> {
-        if fs::try_exists(event_log_path).await? {
-            return Ok(());
-        }
-        let migrated_path = self.sessions_directory.join("local.ndjson.migrated");
-        if fs::try_exists(&migrated_path).await? {
-            return Ok(());
-        }
-        let legacy_path = self.sessions_directory.join("local.ndjson");
-        let contents = match fs::read_to_string(&legacy_path).await {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut migrated = Vec::new();
-        for (index, line) in contents.lines().enumerate() {
-            let Ok(mut event) = serde_json::from_str::<Event>(line) else {
-                self.quarantine_legacy_log(&legacy_path).await?;
-                return Ok(());
-            };
-            let expected = u64::try_from(index).unwrap_or(u64::MAX) + 1;
-            if event.session_id() != "local" || event.sequence() != expected {
-                self.quarantine_legacy_log(&legacy_path).await?;
-                return Ok(());
-            }
-            replace_event_session_id(&mut event, session_id);
-            serde_json::to_writer(&mut migrated, &event)
-                .map_err(|error| RegistryError::InvalidMetadata(error.to_string()))?;
-            migrated.push(b'\n');
-        }
-        fs::rename(&legacy_path, migrated_path).await?;
-        atomic_write(event_log_path, migrated).await?;
-        Ok(())
-    }
-
-    async fn quarantine_legacy_log(&self, legacy_path: &Path) -> Result<(), RegistryError> {
-        for suffix in 0_u32..=u32::MAX {
-            let file_name = if suffix == 0 {
-                "local.ndjson.corrupt".to_owned()
-            } else {
-                format!("local.ndjson.corrupt.{suffix}")
-            };
-            let candidate = self.sessions_directory.join(file_name);
-            if !fs::try_exists(&candidate).await? {
-                fs::rename(legacy_path, candidate).await?;
-                return Ok(());
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "no legacy log quarantine path is available",
-        )
-        .into())
+        sessions.insert(
+            session_id.to_owned(),
+            OpenSession {
+                meta,
+                runtime: runtime.clone(),
+            },
+        );
+        Ok(runtime)
     }
 
     fn session_directory(&self, session_id: &str) -> PathBuf {
         self.sessions_directory.join(session_id)
+    }
+
+    /// Sessions bound to `workspace` found on disk. In-memory entries are
+    /// merged by the callers so freshly created sessions list immediately.
+    async fn scan_workspace_sessions(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<PersistedSession>, RegistryError> {
+        let mut found = Vec::new();
+        let mut entries = match fs::read_dir(&self.sessions_directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(found),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                // Stray files (e.g. a quarantined legacy log) are not sessions.
+                continue;
+            }
+            let metadata_path = entry.path().join(METADATA_FILE);
+            let contents = match fs::read(&metadata_path).await {
+                Ok(contents) => contents,
+                Err(_) => continue,
+            };
+            let Ok(meta) = serde_json::from_slice::<PersistedSession>(&contents) else {
+                // Unreadable or legacy-shaped metadata: skip, never block listing.
+                continue;
+            };
+            if meta.workspace == workspace {
+                found.push(meta);
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -252,38 +338,44 @@ impl AgentFactory for NoAgentFactory {
     }
 }
 
-fn default_session_id(workspace: &str) -> String {
+/// Fresh sessions pair the workspace fingerprint with random bytes so they
+/// stay filesystem-safe, unique per workspace, and sortable by creation.
+fn unique_session_id(workspace: &str) -> Result<String, RegistryError> {
     let digest = Sha256::digest(workspace.as_bytes());
-    let mut id = String::with_capacity(72);
+    let mut random = [0_u8; 4];
+    getrandom::fill(&mut random).map_err(|error| {
+        RegistryError::InvalidMetadata(format!("could not generate a session ID: {error}"))
+    })?;
+    let mut id = String::with_capacity(32);
     id.push_str("session-");
-    for byte in digest {
+    for byte in &digest[..8] {
         write!(&mut id, "{byte:02x}").expect("writing to a string cannot fail");
     }
-    id
-}
-
-fn replace_event_session_id(event: &mut Event, replacement: &str) {
-    let session_id = match event {
-        Event::Message { session_id, .. }
-        | Event::RunStarted { session_id, .. }
-        | Event::AssistantTextDelta { session_id, .. }
-        | Event::AssistantMessage { session_id, .. }
-        | Event::ToolCallStarted { session_id, .. }
-        | Event::ToolCallCompleted { session_id, .. }
-        | Event::RunCompleted { session_id, .. }
-        | Event::RunFailed { session_id, .. } => session_id,
-    };
-    *session_id = replacement.to_owned();
+    id.push('-');
+    for byte in random {
+        write!(&mut id, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(id)
 }
 
 fn validate_session_id(session_id: &str) -> Result<(), RegistryError> {
-    let digest = session_id
+    let rest = session_id
         .strip_prefix("session-")
         .ok_or_else(|| RegistryError::InvalidSessionId(session_id.to_owned()))?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(RegistryError::InvalidSessionId(session_id.to_owned()));
+    let hex = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let valid = rest.len() <= 80
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        && !rest.starts_with('-')
+        && !rest.ends_with('-')
+        && !rest.contains("--")
+        && rest.split('-').all(hex);
+    if valid {
+        Ok(())
+    } else {
+        Err(RegistryError::InvalidSessionId(session_id.to_owned()))
     }
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -341,6 +433,8 @@ impl LocalSession {
         &self,
         client_id: &str,
         model: &ModelRef,
+        reasoning_effort: Option<ReasoningEffort>,
+        allowed_tools: Option<Vec<String>>,
         text: &str,
     ) -> Result<Event, SessionError> {
         let (reply, response) = oneshot::channel();
@@ -348,6 +442,8 @@ impl LocalSession {
             .send(SessionCommand::AppendMessage {
                 client_id: client_id.to_owned(),
                 model: model.clone(),
+                reasoning_effort,
+                allowed_tools,
                 text: text.to_owned(),
                 reply,
             })
@@ -370,6 +466,8 @@ enum SessionCommand {
     AppendMessage {
         client_id: String,
         model: ModelRef,
+        reasoning_effort: Option<ReasoningEffort>,
+        allowed_tools: Option<Vec<String>>,
         text: String,
         reply: oneshot::Sender<Result<Event, SessionError>>,
     },
@@ -398,6 +496,8 @@ async fn run_session(
             SessionCommand::AppendMessage {
                 client_id,
                 model,
+                reasoning_effort,
+                allowed_tools,
                 text,
                 reply,
             } => {
@@ -435,6 +535,7 @@ async fn run_session(
                         sequence: next_sequence(&events),
                         run_id: run_id.clone(),
                         model: model.clone(),
+                        reasoning_effort,
                         created_at_ms: timestamp_ms(),
                     };
                     if let Err(error) =
@@ -450,6 +551,8 @@ async fn run_session(
                         Arc::clone(agent),
                         AgentRequest {
                             model,
+                            reasoning_effort,
+                            allowed_tools,
                             messages: model_history(&events),
                         },
                         run_id,
@@ -793,65 +896,73 @@ impl From<io::Error> for SessionError {
 
 #[cfg(test)]
 mod tests {
-    use nexa_protocol::{Event, ModelRef, SessionInfo};
     use tempfile::tempdir;
 
     use super::{RegistryError, SessionRegistry};
 
-    #[tokio::test]
-    async fn migrates_the_legacy_local_log_into_the_first_workspace() {
-        let state = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
-        let legacy_event = Event::Message {
-            session_id: "local".to_owned(),
-            sequence: 1,
-            client_id: "legacy-client".to_owned(),
-            model: ModelRef {
-                provider: "legacy-provider".to_owned(),
-                id: "legacy-model".to_owned(),
-            },
-            text: "legacy message".to_owned(),
-            created_at_ms: 1,
-        };
-        let mut contents = serde_json::to_vec(&legacy_event).unwrap();
-        contents.push(b'\n');
-        tokio::fs::write(state.path().join("local.ndjson"), contents)
-            .await
-            .unwrap();
-
-        let registry = SessionRegistry::without_agent(state.path());
-        let info = registry.open_workspace(workspace.path()).await.unwrap();
-        let session = registry.session(&info.id).await.unwrap();
-        let mut events = session.subscribe().await.unwrap();
-        let migrated = events.recv().await.unwrap();
-
-        assert_eq!(migrated.session_id(), info.id);
-        assert_eq!(migrated.sequence(), 1);
-        assert!(!state.path().join("local.ndjson").exists());
-        assert!(state.path().join("local.ndjson.migrated").exists());
-        let persisted: SessionInfo = serde_json::from_slice(
-            &tokio::fs::read(state.path().join(&info.id).join("session.json"))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(persisted, info);
+    /// Bumps wall-clock time past a millisecond boundary so activity stamps
+    /// differ deterministically.
+    async fn tick() {
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     }
 
     #[tokio::test]
-    async fn reopening_a_workspace_returns_its_persisted_session() {
+    async fn every_created_session_gets_a_distinct_id() {
         let state = tempdir().unwrap();
         let workspace = tempdir().unwrap();
-        let first = SessionRegistry::without_agent(state.path())
-            .open_workspace(workspace.path())
-            .await
-            .unwrap();
-        let second = SessionRegistry::without_agent(state.path())
-            .open_workspace(workspace.path())
-            .await
-            .unwrap();
+        let registry = SessionRegistry::without_agent(state.path());
 
-        assert_eq!(first, second);
+        let first = registry.create_session(workspace.path()).await.unwrap();
+        tick().await;
+        let second = registry.create_session(workspace.path()).await.unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.workspace, second.workspace);
+
+        // Re-opening by ID works across registry instances.
+        assert!(
+            SessionRegistry::without_agent(state.path())
+                .session(&second.id)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_and_lists_multiple_sessions_per_workspace() {
+        let state = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let registry = SessionRegistry::without_agent(state.path());
+
+        let first = registry.create_session(workspace.path()).await.unwrap();
+        tick().await;
+        let second = registry.create_session(workspace.path()).await.unwrap();
+        assert_ne!(first.id, second.id);
+
+        let listed = registry.list_sessions(workspace.path()).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        // Most recently opened first: the freshly created session.
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(listed[1].id, first.id);
+    }
+
+    #[tokio::test]
+    async fn workspaces_keep_independent_session_lists() {
+        let state = tempdir().unwrap();
+        let workspace_a = tempdir().unwrap();
+        let workspace_b = tempdir().unwrap();
+        let registry = SessionRegistry::without_agent(state.path());
+
+        registry.create_session(workspace_a.path()).await.unwrap();
+        tick().await;
+        let b_only = registry.create_session(workspace_b.path()).await.unwrap();
+        tick().await;
+        registry.create_session(workspace_a.path()).await.unwrap();
+
+        let listed_a = registry.list_sessions(workspace_a.path()).await.unwrap();
+        assert_eq!(listed_a.len(), 2);
+        let listed_b = registry.list_sessions(workspace_b.path()).await.unwrap();
+        assert_eq!(listed_b.len(), 1);
+        assert_eq!(listed_b[0].id, b_only.id);
     }
 
     #[tokio::test]
@@ -863,20 +974,5 @@ mod tests {
             registry.session("../../etc").await,
             Err(RegistryError::InvalidSessionId(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn quarantines_a_corrupt_legacy_log_without_blocking_the_workspace() {
-        let state = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
-        tokio::fs::write(state.path().join("local.ndjson"), b"not json\n")
-            .await
-            .unwrap();
-
-        let registry = SessionRegistry::without_agent(state.path());
-        let info = registry.open_workspace(workspace.path()).await.unwrap();
-        assert!(registry.session(&info.id).await.is_ok());
-        assert!(!state.path().join("local.ndjson").exists());
-        assert!(state.path().join("local.ndjson.corrupt").exists());
     }
 }
