@@ -1,18 +1,23 @@
 use std::{
     env,
     error::Error,
-    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    time::Duration,
 };
 
+use crossterm::{
+    cursor::{Hide, MoveUp, Show},
+    event::{Event, KeyCode, KeyEventKind, KeyModifiers, read},
+    execute, queue,
+    style::Print,
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
+};
 use nexa_client::NexaClient;
 use nexa_harness::{
-    CredentialFile, ProviderConfig, ProviderCredential, ProviderFile, load_or_create_server_token,
+    AuthStyle, CredentialFile, DefaultModel, ModelEntry, ModelInfo, ModelsSettings, ProviderConfig,
+    ProviderCredential, ProviderFile, discover_models, load_or_create_server_token,
 };
-use nexa_protocol::ApiFormat;
+use nexa_protocol::{ApiFormat, ModelRef, ReasoningEffort};
 
 type CliResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -29,7 +34,7 @@ async fn run() -> CliResult {
     match arguments.as_slice() {
         [] => chat_or_setup().await,
         [command] if command == "chat" => chat_or_setup().await,
-        [group, command] if group == "provider" && command == "add" => add_provider(),
+        [group, command] if group == "provider" && command == "add" => add_provider().await,
         [flag] if flag == "--help" || flag == "-h" || flag == "help" => {
             print_help();
             Ok(())
@@ -48,7 +53,7 @@ async fn chat_or_setup() -> CliResult {
             .is_empty()
     {
         println!("No providers are configured yet.\n");
-        return add_provider();
+        return add_provider().await;
     }
     chat().await
 }
@@ -72,7 +77,7 @@ fn print_help() {
     );
 }
 
-fn add_provider() -> CliResult {
+async fn add_provider() -> CliResult {
     println!("Add OpenAI-compatible provider\n");
     let name = prompt_required("Name")?;
     let id = provider_id(&name);
@@ -80,8 +85,15 @@ fn add_provider() -> CliResult {
         return Err("name must contain at least one letter or number".into());
     }
     let base_url = prompt_required("Base URL (include /v1 when required)")?;
-    let model = prompt_required("Model ID")?;
-    let api_key = rpassword::prompt_password("API key (leave blank for none): ")?;
+    let base_url = if base_url.contains("://") {
+        base_url
+    } else {
+        println!("No URL scheme given; assuming http://{base_url}.");
+        format!("http://{base_url}")
+    };
+    let api_key = rpassword::prompt_password("API key (leave blank for none): ")?
+        .trim()
+        .to_owned();
 
     let provider_path = provider_path()?;
     let credentials_path = credentials_path()?;
@@ -94,19 +106,24 @@ fn add_provider() -> CliResult {
         .into());
     }
 
+    let models =
+        choose_models(&base_url, (!api_key.is_empty()).then_some(api_key.as_str())).await?;
+    let (models, auth) = models;
+
     registry.providers.insert(
         id.clone(),
         ProviderConfig {
             name,
             base_url,
             api_format: ApiFormat::ChatCompletions,
-            models: vec![model],
+            models,
             api_key_env: None,
+            auth,
         },
     );
     registry.save(&provider_path)?;
 
-    if !api_key.trim().is_empty() {
+    if !api_key.is_empty() {
         let mut credentials = CredentialFile::load_or_default(&credentials_path)?;
         credentials
             .providers
@@ -118,6 +135,178 @@ fn add_provider() -> CliResult {
         "\nAdded {id:?} using chat completions. Start or restart nexa-server, then run `nexa chat`."
     );
     Ok(())
+}
+
+async fn choose_models(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> CliResult<(Vec<ModelEntry>, AuthStyle)> {
+    println!("\nFetching available models from {base_url}…");
+    let mut auth = AuthStyle::Bearer;
+    match discover_models(base_url, api_key, auth).await {
+        Ok(models) if !models.is_empty() => select_models(&models).map(|picked| (picked, auth)),
+        first_attempt => {
+            // Some gateways only accept the Anthropic-style `x-api-key`
+            // header; retry with it before giving up on discovery.
+            if let Some(api_key) = api_key {
+                auth = auth.alternate();
+                if let Ok(models) = discover_models(base_url, Some(api_key), auth).await
+                    && !models.is_empty()
+                {
+                    println!("Provider authenticated with the x-api-key header.");
+                    return select_models(&models).map(|picked| (picked, auth));
+                }
+            }
+            match first_attempt {
+                Ok(_) => eprintln!("The provider listed no models; enter them manually."),
+                Err(error) => eprintln!("Could not list models ({error}); enter them manually."),
+            }
+            manual_models().map(|models| (models, AuthStyle::Bearer))
+        }
+    }
+}
+
+fn manual_models() -> CliResult<Vec<ModelEntry>> {
+    let value = prompt_required("Model ID (separate several with commas)")?;
+    let models = value
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(|model| ModelEntry::Plain(model.to_owned()))
+        .collect::<Vec<_>>();
+    if models.is_empty() {
+        return Err("at least one model ID is required".into());
+    }
+    Ok(models)
+}
+
+const MODEL_VIEWPORT_ROWS: usize = 10;
+
+fn select_models(models: &[ModelInfo]) -> CliResult<Vec<ModelEntry>> {
+    if models.is_empty() {
+        return Err("at least one model ID is required".into());
+    }
+    let mut stdout = io::stdout();
+    let _raw_mode = RawModeGuard::enable()?;
+    execute!(stdout, Hide)?;
+
+    let mut checked = vec![false; models.len()];
+    let mut cursor = 0usize;
+    let mut notice: Option<&'static str> = None;
+    loop {
+        draw_model_picker(&mut stdout, models, &checked, cursor, notice)?;
+        match read()? {
+            Event::Key(event)
+                if matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
+                match event.code {
+                    KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err("provider setup cancelled".into());
+                    }
+                    KeyCode::Esc => return Err("provider setup cancelled".into()),
+                    KeyCode::Down => {
+                        notice = None;
+                        cursor = (cursor + 1) % models.len();
+                    }
+                    KeyCode::Up => {
+                        notice = None;
+                        cursor = (cursor + models.len() - 1) % models.len();
+                    }
+                    KeyCode::Char(' ') => {
+                        notice = None;
+                        checked[cursor] = !checked[cursor];
+                    }
+                    KeyCode::Enter => {
+                        if checked.iter().all(|is_checked| !is_checked) {
+                            notice = Some("Check at least one model before continuing.");
+                            continue;
+                        }
+                        queue!(stdout, Clear(ClearType::FromCursorDown))?;
+                        stdout.flush()?;
+                        return Ok(models
+                            .iter()
+                            .zip(checked)
+                            .filter(|(_, is_checked)| *is_checked)
+                            .map(|(model, _)| {
+                                if let Some(efforts) = &model.reasoning_efforts {
+                                    ModelEntry::Detailed {
+                                        id: model.id.clone(),
+                                        reasoning_efforts: Some(efforts.clone()),
+                                    }
+                                } else {
+                                    ModelEntry::Plain(model.id.clone())
+                                }
+                            })
+                            .collect());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw_model_picker(
+    stdout: &mut io::Stdout,
+    models: &[ModelInfo],
+    checked: &[bool],
+    cursor: usize,
+    notice: Option<&str>,
+) -> io::Result<()> {
+    let selected_count = checked.iter().filter(|is_checked| **is_checked).count();
+    let viewport_start = cursor
+        .saturating_sub(MODEL_VIEWPORT_ROWS - 1)
+        .min(models.len().saturating_sub(MODEL_VIEWPORT_ROWS));
+    let viewport_end = (viewport_start + MODEL_VIEWPORT_ROWS).min(models.len());
+
+    let mut rows = 0u16;
+    let mut line = |stdout: &mut io::Stdout, text: &str| -> io::Result<()> {
+        queue!(
+            stdout,
+            Print(text.to_owned()),
+            Clear(ClearType::UntilNewLine),
+            Print("\r\n")
+        )?;
+        rows += 1;
+        Ok(())
+    };
+
+    line(
+        stdout,
+        &format!(
+            "Enable models · {selected_count} of {} checked",
+            models.len()
+        ),
+    )?;
+    for index in viewport_start..viewport_end {
+        let state = if checked[index] { "[x]" } else { "[ ]" };
+        let pointer = if index == cursor { ">" } else { " " };
+        line(stdout, &format!("{pointer} {state} {}", models[index].id))?;
+    }
+    line(stdout, "")?;
+    let footer = notice.unwrap_or("↑/↓ move · space check · enter continue · esc cancel");
+    line(stdout, footer)?;
+    stdout.flush()?;
+    queue!(stdout, MoveUp(rows))?;
+    stdout.flush()?;
+    Ok(())
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), Show);
+    }
 }
 
 async fn chat() -> CliResult {
@@ -138,9 +327,73 @@ async fn chat() -> CliResult {
     let workspace = workspace
         .to_str()
         .ok_or("the current workspace path must be UTF-8")?;
-    let session = client.open_workspace(workspace).await?;
-    let client = client.with_session(session.id);
-    nexa_tui::run(client).await?;
+    // Lazy sessions: nothing persists until the first message is sent.
+
+    let settings_path = settings_path()?;
+    let settings = load_settings(&settings_path);
+    let preferred_model = settings.models.default.map(|default| ModelRef {
+        provider: default.provider,
+        id: default.model,
+    });
+    let preferred_effort = settings.models.default_reasoning_effort;
+    let desktop_settings = settings.desktop;
+
+    let (selected_model, selected_effort) = nexa_tui::run(
+        client,
+        workspace.to_owned(),
+        preferred_model.clone(),
+        preferred_effort,
+    )
+    .await?;
+
+    if preferred_model.as_ref() != Some(&selected_model) || preferred_effort != selected_effort {
+        save_settings(
+            &settings_path,
+            desktop_settings,
+            &selected_model,
+            selected_effort,
+        )?;
+    }
+    Ok(())
+}
+
+fn settings_path() -> CliResult<PathBuf> {
+    Ok(nexa_home()?.join("settings.toml"))
+}
+
+/// Settings are convenience state; a broken file never blocks chatting.
+fn load_settings(path: &Path) -> nexa_harness::SettingsFile {
+    match nexa_harness::SettingsFile::load_or_default(path) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!(
+                "Ignoring unreadable settings file {}: {error}",
+                path.display()
+            );
+            nexa_harness::SettingsFile::default()
+        }
+    }
+}
+
+/// Saves the chosen model/effort as this file's new defaults, preserving
+/// `desktop` (the desktop client's own state) rather than overwriting it.
+fn save_settings(
+    path: &Path,
+    desktop: nexa_harness::DesktopSettings,
+    model: &ModelRef,
+    effort: Option<ReasoningEffort>,
+) -> CliResult<()> {
+    nexa_harness::SettingsFile {
+        models: ModelsSettings {
+            default: Some(DefaultModel {
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+            }),
+            default_reasoning_effort: effort,
+        },
+        desktop,
+    }
+    .save(path)?;
     Ok(())
 }
 
@@ -150,92 +403,25 @@ fn default_server_url() -> String {
 }
 
 async fn ensure_local_server(client: &NexaClient) -> CliResult {
-    match client.providers().await {
-        Ok(_) => return Ok(()),
-        Err(error) if error.is_connect() => {}
-        Err(error) => return Err(error.into()),
-    }
-
     let log_path = nexa_home()?.join("logs/server.log");
-    println!("Starting Nexa server…");
-    let mut server = spawn_server(&log_path)?;
-    let mut exit_status = None;
-
-    for _ in 0..50 {
-        if exit_status.is_none() {
-            exit_status = server.try_wait()?;
-        }
-        match client.providers().await {
-            Ok(_) => return Ok(()),
-            Err(error) if error.is_connect() => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = client.clone();
+    nexa_harness::ensure_local_server(
+        &log_path,
+        move || {
+            let client = client.clone();
+            async move {
+                match client.providers().await {
+                    Ok(_) => Ok(nexa_harness::ServerProbe::Ready),
+                    Err(error) if error.is_connect() => Ok(nexa_harness::ServerProbe::Connecting),
+                    Err(error) => Err(nexa_harness::LocalServerError::Failed(error.to_string())),
+                }
             }
-            Err(error) => {
-                stop_child(&mut server);
-                return Err(error.into());
-            }
-        }
-    }
-
-    stop_child(&mut server);
-    let reason = exit_status.map_or_else(
-        || "nexa-server did not become ready".to_owned(),
-        |status| format!("nexa-server exited with {status} and no local server became ready"),
-    );
-    Err(format!("{reason}; see {}", log_path.display()).into())
+        },
+        || println!("Starting Nexa server…"),
+    )
+    .await?;
+    Ok(())
 }
-
-fn stop_child(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(None)) {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-fn spawn_server(log_path: &Path) -> CliResult<Child> {
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let errors = log.try_clone()?;
-    let mut command = Command::new(server_binary()?);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(errors));
-    detach(&mut command);
-    command.spawn().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not start nexa-server: {error}"),
-        )
-        .into()
-    })
-}
-
-fn server_binary() -> CliResult<PathBuf> {
-    let current_executable = env::current_exe()?;
-    let sibling =
-        current_executable.with_file_name(format!("nexa-server{}", env::consts::EXE_SUFFIX));
-    if sibling.is_file() {
-        Ok(sibling)
-    } else {
-        Ok(PathBuf::from("nexa-server"))
-    }
-}
-
-#[cfg(unix)]
-fn detach(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn detach(_command: &mut Command) {}
 
 fn prompt_required(label: &str) -> io::Result<String> {
     loop {

@@ -1,11 +1,75 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Wire-protocol revision. Servers advertise it on every response via the
+/// `x-nexa-protocol` header; clients refuse servers older than themselves.
+pub const PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiFormat {
     #[default]
     ChatCompletions,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Every effort level, ordered from least to most expensive.
+    pub const ALL: [ReasoningEffort; 6] = [
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
+    /// Levels shown when a provider says reasoning is supported but does not
+    /// enumerate which values it accepts.
+    ///
+    /// This is Grok Build's fallback menu and OpenCode's widely-supported set
+    /// plus `xhigh`. `minimal` and `max` stay out unless a model lists them.
+    pub const COMMON: [ReasoningEffort; 4] = [Self::Low, Self::Medium, Self::High, Self::XHigh];
+
+    /// Parses the lowercase wire spelling used by OpenAI-compatible APIs.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|effort| {
+            let wire = match effort {
+                Self::XHigh => "xhigh",
+                other => other.serialize_str(),
+            };
+            wire.eq_ignore_ascii_case(value)
+        })
+    }
+
+    fn serialize_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// The lowercase wire spelling sent to providers.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        self.serialize_str()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -14,12 +78,22 @@ pub struct ProviderSummary {
     pub id: String,
     pub name: String,
     pub api_format: ApiFormat,
-    pub models: Vec<String>,
+    pub models: Vec<ModelSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OpenSessionRequest {
+pub struct ModelSummary {
+    pub id: String,
+    /// Reasoning effort levels the provider reports for this model. `None`
+    /// means the endpoint did not declare support either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRequest {
     pub workspace: String,
 }
 
@@ -28,6 +102,26 @@ pub struct OpenSessionRequest {
 pub struct SessionInfo {
     pub id: String,
     pub workspace: String,
+}
+
+/// A named agent preset: an immutable tool scope applied per chat.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetSummary {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Tool names the preset allows. An empty list means every tool.
+    pub tools: Vec<String>,
+}
+
+/// A persisted session without its transcript: enough for pickers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at_ms: u64,
+    pub last_opened_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,6 +140,11 @@ pub enum Command {
         #[serde(rename = "clientId")]
         client_id: String,
         model: ModelRef,
+        /// Agent preset scoping the tools available for this run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preset: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffort>,
         text: String,
     },
 }
@@ -113,6 +212,8 @@ pub enum Event {
         #[serde(rename = "runId")]
         run_id: String,
         model: ModelRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffort>,
         #[serde(rename = "createdAtMs")]
         created_at_ms: u64,
     },

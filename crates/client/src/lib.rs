@@ -1,7 +1,8 @@
 use std::{error::Error, fmt, str::Utf8Error, sync::Arc, time::Duration};
 
 use nexa_protocol::{
-    AcceptedCommand, Command, Event, ModelRef, OpenSessionRequest, ProviderSummary, SessionInfo,
+    AcceptedCommand, Command, Event, ModelRef, PROTOCOL_VERSION, PresetSummary, ProviderSummary,
+    ReasoningEffort, SessionInfo, SessionSummary, WorkspaceRequest,
 };
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 
@@ -40,9 +41,37 @@ impl NexaClient {
         self
     }
 
+    /// Re-points this client at another session without consuming it.
+    pub fn select_session(&mut self, session_id: impl Into<String>) {
+        self.session_id = Some(session_id.into());
+    }
+
+    /// Detaches from any session. The next message will not have one either;
+    /// pair with [`NexaClient::create_session`](Self::create_session) when a
+    /// conversation should materialize.
+    pub fn clear_session(&mut self) {
+        self.session_id = None;
+    }
+
+    #[must_use]
+    pub fn has_session(&self) -> bool {
+        self.session_id.is_some()
+    }
+
     pub async fn providers(&self) -> Result<Vec<ProviderSummary>, ClientError> {
         let response = self
             .request(self.http.get(self.endpoint("/providers")))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        let response = accepted_response(response).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Agent presets loaded on the server, alphabetical by name.
+    pub async fn presets(&self) -> Result<Vec<PresetSummary>, ClientError> {
+        let response = self
+            .request(self.http.get(self.endpoint("/presets")))
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await?;
@@ -56,7 +85,41 @@ impl NexaClient {
     ) -> Result<SessionInfo, ClientError> {
         let response = self
             .request(self.http.post(self.endpoint("/sessions/open")))
-            .json(&OpenSessionRequest {
+            .json(&WorkspaceRequest {
+                workspace: workspace.into(),
+            })
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        let response = accepted_response(response).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Creates a fresh session bound to `workspace`.
+    pub async fn create_session(
+        &self,
+        workspace: impl Into<String>,
+    ) -> Result<SessionInfo, ClientError> {
+        let response = self
+            .request(self.http.post(self.endpoint("/sessions/create")))
+            .json(&WorkspaceRequest {
+                workspace: workspace.into(),
+            })
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        let response = accepted_response(response).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Sessions previously bound to `workspace`, most recently opened first.
+    pub async fn list_sessions(
+        &self,
+        workspace: impl Into<String>,
+    ) -> Result<Vec<SessionSummary>, ClientError> {
+        let response = self
+            .request(self.http.post(self.endpoint("/sessions/list")))
+            .json(&WorkspaceRequest {
                 workspace: workspace.into(),
             })
             .timeout(REQUEST_TIMEOUT)
@@ -81,6 +144,8 @@ impl NexaClient {
     pub async fn send_message(
         &self,
         model: ModelRef,
+        preset: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
         text: impl Into<String>,
     ) -> Result<AcceptedCommand, ClientError> {
         let session_id = self.session_id()?.to_owned();
@@ -90,6 +155,8 @@ impl NexaClient {
                 session_id,
                 client_id: self.client_id.clone(),
                 model,
+                preset,
+                reasoning_effort,
                 text: text.into(),
             })
             .timeout(REQUEST_TIMEOUT)
@@ -156,14 +223,32 @@ enum FrameRead {
 
 async fn accepted_response(response: Response) -> Result<Response, ClientError> {
     let status = response.status();
-    if status.is_success() {
-        return Ok(response);
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("could not read response: {error}"));
+        return Err(ClientError::Rejected { status, body });
     }
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("could not read response: {error}"));
-    Err(ClientError::Rejected { status, body })
+    check_protocol(&response)?;
+    Ok(response)
+}
+
+/// Refuses servers that predate the client's wire protocol so version skew
+/// surfaces as an actionable message instead of a JSON decode failure.
+fn check_protocol(response: &Response) -> Result<(), ClientError> {
+    let server_version = response
+        .headers()
+        .get("x-nexa-protocol")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok());
+    if server_version.is_some_and(|version| version >= PROTOCOL_VERSION) {
+        return Ok(());
+    }
+    Err(ClientError::StaleServer {
+        server_version: server_version.unwrap_or(1),
+        client_version: PROTOCOL_VERSION,
+    })
 }
 
 fn take_event(buffer: &mut Vec<u8>) -> Result<FrameRead, ClientError> {
@@ -202,8 +287,15 @@ pub enum ClientError {
     Http(reqwest::Error),
     InvalidEvent(serde_json::Error),
     InvalidUtf8(Utf8Error),
-    Rejected { status: StatusCode, body: String },
+    Rejected {
+        status: StatusCode,
+        body: String,
+    },
     SessionNotSelected,
+    StaleServer {
+        server_version: u32,
+        client_version: u32,
+    },
     StreamClosed,
 }
 
@@ -224,6 +316,14 @@ impl fmt::Display for ClientError {
                 write!(formatter, "runtime rejected the request ({status}): {body}")
             }
             Self::SessionNotSelected => formatter.write_str("no Nexa session is selected"),
+            Self::StaleServer {
+                server_version,
+                client_version,
+            } => write!(
+                formatter,
+                "the running nexa-server speaks protocol v{server_version}, but this client \
+                 requires v{client_version}; restart nexa-server so both run the current build"
+            ),
             Self::StreamClosed => formatter.write_str("runtime event stream closed"),
         }
     }
@@ -236,6 +336,7 @@ impl Error for ClientError {
             Self::InvalidEvent(error) => Some(error),
             Self::InvalidUtf8(error) => Some(error),
             Self::Rejected { .. } | Self::SessionNotSelected | Self::StreamClosed => None,
+            Self::StaleServer { .. } => None,
         }
     }
 }
@@ -262,7 +363,48 @@ impl From<Utf8Error> for ClientError {
 mod tests {
     use nexa_protocol::Event;
 
-    use super::{FrameRead, take_event};
+    use super::{ClientError, FrameRead, NexaClient, take_event};
+
+    #[tokio::test]
+    async fn refuses_servers_that_do_not_advertise_the_protocol() {
+        use axum::{Json, Router, routing::get};
+        use serde_json::json;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // A pre-handshake server: no x-nexa-protocol header anywhere.
+            async fn legacy_providers() -> Json<serde_json::Value> {
+                Json(json!([{
+                    "id": "old",
+                    "name": "Old",
+                    "apiFormat": "chat_completions",
+                    "models": ["plain-model"],
+                }]))
+            }
+            axum::serve(
+                listener,
+                Router::new().route("/providers", get(legacy_providers)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = NexaClient::new(base_url, "test");
+        let error = client.providers().await.unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::StaleServer {
+                server_version: 1,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("restart nexa-server"));
+
+        server.abort();
+    }
 
     #[test]
     fn decodes_an_event_without_exposing_sse_metadata() {

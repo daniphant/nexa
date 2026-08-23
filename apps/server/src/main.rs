@@ -10,6 +10,7 @@ use nexa_harness::{
     Agent, CredentialFile, HarnessAgent, Provider, ProviderFile, ProviderRegistry, WorkspaceTools,
     load_or_create_server_token,
 };
+use nexa_protocol::PresetSummary;
 use nexa_runtime::{AgentFactory, SessionRegistry};
 use tokio::net::TcpListener;
 
@@ -26,6 +27,58 @@ impl AgentFactory for NativeAgentFactory {
     }
 }
 
+/// One loaded agent preset from `$NEXA_HOME/agent-presets/<name>.toml`.
+#[derive(Clone)]
+struct Preset {
+    summary: PresetSummary,
+    tools: Vec<String>,
+}
+
+impl Preset {
+    fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            description: String,
+            /// Tool allow-list. Empty or missing means every tool.
+            #[serde(default)]
+            tools: Vec<String>,
+        }
+        let raw = std::fs::read_to_string(path)?;
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let file: File = toml::from_str(&raw)?;
+        Ok(Self {
+            summary: PresetSummary {
+                name,
+                description: file.description,
+                tools: file.tools.clone(),
+            },
+            tools: file.tools,
+        })
+    }
+}
+
+fn load_presets(directory: &Path) -> Result<Vec<Preset>, Box<dyn Error>> {
+    let mut presets = Vec::new();
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(presets),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+            presets.push(Preset::load(&path)?);
+        }
+    }
+    presets.sort_by(|left, right| left.summary.name.cmp(&right.summary.name));
+    Ok(presets)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let port = env::var("NEXA_PORT")
@@ -39,6 +92,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sessions_directory = env::var_os("NEXA_SESSIONS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| nexa_home.join("sessions"));
+    let presets_directory = env::var_os("NEXA_PRESETS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| nexa_home.join("agent-presets"));
     let provider_path = env::var_os("NEXA_PROVIDER_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| nexa_home.join("provider.toml"));
@@ -66,12 +122,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         sessions_directory,
         Arc::new(NativeAgentFactory { providers }),
     );
+    let preset_list = load_presets(&presets_directory)?;
+    let preset_count = preset_list.len();
+    let presets: Vec<(String, Vec<String>)> = preset_list
+        .into_iter()
+        .map(|preset| (preset.summary.name, preset.tools))
+        .collect();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
 
     println!(
-        "Nexa server listening at http://{} with {model_count} available model(s)",
+        "Nexa server listening at http://{} with {model_count} available model(s) and {preset_count} agent preset(s)",
         listener.local_addr()?
     );
-    nexa_server::serve_with_catalog(listener, sessions, catalog, auth_token).await?;
+    nexa_server::serve_with_catalog(listener, sessions, catalog, presets, auth_token).await?;
     Ok(())
 }
